@@ -1,0 +1,466 @@
+"""CodingAgent Web 客户端 — 本地 HTTP 服务 + 浏览器界面。
+
+用法：
+    python -m CodingAgent.server [workspace]              # 打开 http://127.0.0.1:8765
+    python -m CodingAgent.server . --port 9000 -y         # 指定端口 + 自动确认
+
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlsplit, parse_qs
+
+from .agent import Agent
+from .cli import build_system_prompt
+from .context import Context
+from .llm import LLMClient, LLMError
+from .safety import AutoSafety, SafetyPolicy
+from .session import Session
+from .tools import build_registry
+
+WEB_DIR = Path(__file__).parent / "web"
+
+
+# ---------------------------------------------------------------- #
+# 事件总线：Agent 工作线程 publish，SSE 连接线程消费
+# ---------------------------------------------------------------- #
+class EventBus:
+    def __init__(self):
+        self.events: list[dict] = []
+        self.cond = threading.Condition()
+
+    def publish(self, kind: str, payload: dict) -> None:
+        with self.cond:
+            self.events.append({"seq": len(self.events),
+                                "kind": kind, "payload": payload})
+            self.cond.notify_all()
+
+    def wait_batch(self, after: int, timeout: float = 15.0):
+        """等待 after 之后的新事件；超时返回空批（SSE 用作 keepalive）。"""
+        with self.cond:
+            if after >= len(self.events) - 1:
+                if not self.cond.wait(timeout):
+                    return after, []
+            batch = self.events[after + 1:]
+            return (batch[-1]["seq"] if batch else after), batch
+
+
+# ---------------------------------------------------------------- #
+# Web 版安全器：确认请求抛给浏览器，阻塞等待决策
+# ---------------------------------------------------------------- #
+def _brief_args(args: dict) -> str:
+    try:
+        s = json.dumps(args, ensure_ascii=False)
+    except (TypeError, ValueError):
+        s = str(args)
+    return s if len(s) <= 300 else s[:297] + "…"
+
+
+class WebSafety:
+    """Agent 循环调用 check(tool, args) -> bool（协议与 CLI 的 ConfirmSafety 一致）。
+
+    confirm 级操作 → publish confirm_request 事件 → 阻塞等浏览器 POST /api/decision
+    超时（默认 10 分钟）视为拒绝，Agent 循环继续，绝不死锁。
+    """
+
+    def __init__(self, bus: EventBus, policy: SafetyPolicy | None = None,
+                 timeout: float = 600.0):
+        self.policy = policy or SafetyPolicy()
+        self.bus = bus
+        self.timeout = timeout
+        self.auto_allowed = False
+        self.denied: list[tuple[str, str]] = []
+        self.confirmed: list[str] = []
+        self._pending: dict[int, dict] = {}
+        self._next_id = 0
+
+    def check(self, tool, args: dict) -> bool:
+        name = getattr(tool, "name", str(tool))
+        decision, reason = self.policy.classify(name, args or {})
+
+        if decision == "allow":
+            return True
+        if decision == "deny":
+            self.denied.append((name, reason))
+            self.bus.publish("denied", {"tool": name, "reason": reason})
+            return False
+
+        if self.auto_allowed:  # 用户在浏览器按过"全部允许"
+            self.confirmed.append(f"{name}: {reason} (auto)")
+            return True
+
+        cid = self._next_id
+        self._next_id += 1
+        req = {"id": cid, "tool": name, "reason": reason,
+               "args": _brief_args(args), "answer": None,
+               "event": threading.Event()}
+        self._pending[cid] = req
+        self.bus.publish("confirm_request",
+                         {"id": cid, "tool": name, "reason": reason,
+                          "args": req["args"]})
+        ok = req["event"].wait(self.timeout)
+        self._pending.pop(cid, None)
+        answer = req["answer"] if ok else "n"  # 超时 = 拒绝
+
+        self.bus.publish("confirm_result",
+                         {"id": cid, "answer": answer,
+                          "approved": answer in ("y", "a")})
+        if answer == "a":
+            self.auto_allowed = True
+        if answer in ("y", "a"):
+            self.confirmed.append(f"{name}: {reason}")
+            return True
+        self.denied.append((name, reason))
+        return False
+
+    def decide(self, cid: int, answer: str) -> bool:
+        """HTTP 线程调用：应答一个挂起的确认。"""
+        req = self._pending.get(cid)
+        if req is None:
+            return False
+        req["answer"] = answer
+        req["event"].set()
+        return True
+
+    def pending(self) -> list[dict]:
+        return [{"id": r["id"], "tool": r["tool"], "reason": r["reason"],
+                 "args": r["args"]} for r in self._pending.values()]
+
+
+class WebAsk:
+    """ask_user 工具的 Web 实现（协议与 WebSafety 同款的事件等待模式）。
+
+    ask(question) → publish ask_request 事件 → 阻塞等浏览器 POST /api/answer
+    → 返回用户输入的自由文本；超时（10 分钟）返回空串，循环不卡死。
+    """
+
+    def __init__(self, bus: EventBus, timeout: float = 600.0):
+        self.bus = bus
+        self.timeout = timeout
+        self._pending: dict[int, dict] = {}
+        self._next_id = 0
+
+    def ask(self, question: str) -> str:
+        qid = self._next_id
+        self._next_id += 1
+        req = {"id": qid, "question": question, "answer": None,
+               "event": threading.Event()}
+        self._pending[qid] = req
+        self.bus.publish("ask_request", {"id": qid, "question": question})
+        ok = req["event"].wait(self.timeout)
+        self._pending.pop(qid, None)
+        answer = (req["answer"] if ok else "") or ""
+        self.bus.publish("ask_result", {"id": qid, "answer": answer})
+        return answer.strip()
+
+    def decide(self, qid: int, answer: str) -> bool:
+        """HTTP 线程调用：应答一个挂起的提问。"""
+        req = self._pending.get(qid)
+        if req is None:
+            return False
+        req["answer"] = answer
+        req["event"].set()
+        return True
+
+    def pending(self) -> list[dict]:
+        return [{"id": r["id"], "question": r["question"]}
+                for r in self._pending.values()]
+
+
+# ---------------------------------------------------------------- #
+# 应用主体（对应 CLI 的 CliApp）
+# ---------------------------------------------------------------- #
+class WebApp:
+    def __init__(self, llm, workspace: str, *, auto: bool = False,
+                 max_turns: int = 40, session_dir: str | None = None):
+        self.llm = llm
+        self.workspace = str(Path(workspace).resolve())
+        self.session_dir = Path(session_dir or
+                                Path(self.workspace) / ".CodingAgent" / "sessions")
+        self.auto = auto
+        self.max_turns = max_turns
+
+        self.bus = EventBus()
+        self.running = False
+        self._run_lock = threading.Lock()
+        self.safety: WebSafety | AutoSafety | None = None
+        self.session: Session | None = None
+        self._saved_len = 0
+        self._task_t0: float | None = None  # 当前任务开始时刻
+        self._last_elapsed_ms: int = 0  # 上一任务总耗时
+        self._last_summary: str = ""  # 上一任务 finish 摘要
+        self._new_session()
+
+    # ---------------------------------------------------------------- #
+    def _new_session(self) -> None:
+        if self.session:
+            self.session.close()
+        self.bus = EventBus()  # 事件流随会话重置
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.session = Session(self.session_dir / f"{ts}.jsonl")
+        self.ctx = Context(system_prompt=build_system_prompt(self.workspace))
+        self.safety = AutoSafety() if self.auto else WebSafety(self.bus)
+        # llm -> 启用 research 子智能体；web_ask -> ask_user 浏览器问答
+        self.web_ask = WebAsk(self.bus)
+        self.agent = Agent(self.llm,
+                           build_registry(self.workspace, llm=self.llm,
+                                          ask=self.web_ask.ask),
+                           context=self.ctx, safety=self.safety,
+                           max_turns=self.max_turns,
+                           on_event=lambda k, p: self.bus.publish(k, p),
+                           on_delta=lambda t: self.bus.publish("delta",
+                                                               {"text": t}))
+        self._saved_len = 0
+
+    def set_auto(self, on: bool) -> None:
+        """运行时切换自动确认（下一轮生效，pending 不受影响）。"""
+        self.auto = on
+        self.agent.safety = AutoSafety() if on else WebSafety(self.bus)
+
+    # ---------------------------------------------------------------- #
+    def start_task(self, message: str) -> tuple[bool, str]:
+        """提交任务；已在运行则拒绝。"""
+        with self._run_lock:
+            if self.running:
+                return False, "已有任务在运行，请等待完成"
+            self.running = True
+        import time as _time
+        self._task_t0 = _time.monotonic()
+        self.bus.publish("user", {"message": message})
+        threading.Thread(target=self._worker, args=(message,),
+                         daemon=True).start()
+        return True, "已开始"
+
+    def _worker(self, message: str) -> None:
+        import time as _time
+        summary = ""
+        try:
+            summary = self.agent.run(message) or ""
+            self._last_summary = summary
+            if summary.startswith(("已达到最大轮数", "模型连续")):
+                self.bus.publish("warning", {"message": summary})
+        except LLMError as e:
+            self.bus.publish("error", {"message": f"模型调用失败: {e}"})
+        except Exception as e:  # 理论上到不了，兜底
+            self.bus.publish("error",
+                             {"message": f"{type(e).__name__}: {e}"})
+        finally:
+            self._flush_session()
+            elapsed = int((_time.monotonic() - (self._task_t0 or _time.monotonic()))
+                          * 1000)
+            self._last_elapsed_ms = elapsed
+            with self._run_lock:
+                self.running = False
+            self.bus.publish("task_end", {"elapsed_ms": elapsed,
+                                          "summary": summary})
+            self._task_t0 = None
+
+    def _flush_session(self) -> None:
+        if not self.session:
+            return
+        fresh = self.ctx.messages[self._saved_len:]
+        if fresh:
+            self.session.extend(fresh)
+            self._saved_len = len(self.ctx.messages)
+
+    # ---------------------------------------------------------------- #
+    def state(self) -> dict:
+        tool_calls = sum(1 for e in self.bus.events
+                         if e["kind"] == "tool_end")
+        turns = sum(1 for e in self.bus.events
+                    if e["kind"] == "turn_start")
+        import time as _time
+        elapsed = (self._last_elapsed_ms if not self.running and self._last_elapsed_ms
+                   else int((_time.monotonic() - self._task_t0) * 1000)
+        if self.running and self._task_t0 else 0)
+        safety = self.safety
+        return {
+            "running": self.running,
+            "workspace": self.workspace,
+            "model": getattr(self.llm, "model", "mock"),
+            "auto": self.auto,
+            "events": self.bus.events[-1000:],
+            "pending": (safety.pending()
+                        if isinstance(safety, WebSafety) else []),
+            "stats": {
+                "messages": len(self.ctx.messages),
+                "tool_calls": tool_calls,
+                "turns": turns,
+                "elapsed_ms": elapsed,
+                "last_summary": self._last_summary,
+                "tokens_estimated": self.ctx.estimate_total(),
+                "token_budget": self.ctx.max_tokens,
+                "session_file": str(self.session.path) if self.session else "",
+                "denied": len(getattr(safety, "denied", [])),
+            },
+        }
+
+
+# ---------------------------------------------------------------- #
+# HTTP 服务
+# ---------------------------------------------------------------- #
+class Handler(BaseHTTPRequestHandler):
+    app: WebApp  # 类属性，serve() 时注入
+
+    def log_message(self, *args):  # 静默访问日志
+        pass
+
+    # ---- 工具方法 ---- #
+    def _json(self, obj: dict, code: int = 200) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+
+    # ---- GET ---- #
+    def do_GET(self):
+        url = urlsplit(self.path)
+        if url.path in ("/", "/index.html"):
+            self._serve_index()
+        elif url.path == "/api/state":
+            self._json(self.app.state())
+        elif url.path == "/api/events":
+            self._serve_sse(url)
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def _serve_index(self) -> None:
+        index = WEB_DIR / "index.html"
+        if not index.exists():
+            self._json({"error": "index.html missing"}, 500)
+            return
+        body = index.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_sse(self, url) -> None:
+        qs = parse_qs(url.query)
+        after = int(qs.get("after", ["-1"])[0])
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            while True:
+                after, batch = self.app.bus.wait_batch(after)
+                if not batch:  # keepalive
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                for e in batch:
+                    data = json.dumps(e, ensure_ascii=False)
+                    self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # 浏览器关掉了页面
+
+    # ---- POST ---- #
+    def do_POST(self):
+        url = urlsplit(self.path)
+        body = self._body()
+        if url.path == "/api/task":
+            message = str(body.get("message", "")).strip()
+            if not message:
+                self._json({"error": "message 为空"}, 400)
+                return
+            ok, msg = self.app.start_task(message)
+            self._json({"ok": ok, "message": msg}, 200 if ok else 409)
+        elif url.path == "/api/decision":
+            safety = self.app.safety
+            if not isinstance(safety, WebSafety):
+                self._json({"ok": False, "error": "当前为自动确认模式"}, 400)
+                return
+            ok = safety.decide(int(body.get("id", -1)),
+                               str(body.get("answer", "n")).lower())
+            self._json({"ok": ok}, 200 if ok else 404)
+        elif url.path == "/api/answer":
+            ok = self.app.web_ask.decide(int(body.get("id", -1)),
+                                         str(body.get("answer", "")))
+            self._json({"ok": ok}, 200 if ok else 404)
+        elif url.path == "/api/new":
+            if self.app.running:
+                self._json({"ok": False, "error": "任务运行中，不能新建"}, 409)
+                return
+            self.app._flush_session()
+            self.app._new_session()
+            self.app.bus.publish("session", {"message": "已开始新会话"})
+            self._json({"ok": True, "session_file":
+                str(self.app.session.path)})
+        elif url.path == "/api/auto":
+            self.app.set_auto(bool(body.get("on")))
+            self.app.bus.publish("session", {
+                "message": "已切换为自动确认（写操作不再询问）"
+                if self.app.auto else "已切换为逐项确认"})
+            self._json({"ok": True, "auto": self.app.auto})
+        else:
+            self._json({"error": "not found"}, 404)
+
+
+def serve(app: WebApp, port: int = 8765, host: str = "127.0.0.1") -> None:
+    Handler.app = app
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    actual = httpd.server_address[1]
+    print(f"CodingAgent Web 客户端已启动: http://{host}:{actual}")
+    print(f"工作区: {app.workspace} | 模型: {getattr(app.llm, 'model', '?')}")
+    print("Ctrl+C 停止服务。")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n服务已停止。")
+    finally:
+        app._flush_session()
+        httpd.server_close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="CodingAgent-server",
+        description="编程智能体 Web 客户端")
+    ap.add_argument("workspace", nargs="?", default=".")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--api-key", default=None)
+    ap.add_argument("--session-dir", default=None)
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="自动确认所有写操作（高危命令仍拦截）")
+    ap.add_argument("--max-turns", type=int, default=40)
+    args = ap.parse_args(argv)
+
+    workspace = str(Path(args.workspace).resolve())
+    if not Path(workspace).is_dir():
+        print(f"错误: 工作区不存在 {workspace}", file=sys.stderr)
+        return 2
+    try:
+        llm = LLMClient()
+    except LLMError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 2
+
+    app = WebApp(llm, workspace, auto=args.yes,
+                 max_turns=args.max_turns, session_dir=args.session_dir)
+    serve(app, port=args.port, host=args.host)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

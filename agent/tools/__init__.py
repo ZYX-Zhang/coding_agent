@@ -29,7 +29,7 @@ __all__ = [
 ]
 
 
-def build_registry(workspace: str) -> ToolRegistry:
+def build_registry(workspace: str, llm=None, ask=None) -> ToolRegistry:
     """装配默认工具集。Agent 循环只拿这个注册表，加新工具不改循环。"""
     reg = ToolRegistry()
     # 顺序即下发给模型的 tools 顺序，finish 放最后

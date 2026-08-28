@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from .context import Context
 from .tools import FINISH_MARKER
@@ -42,6 +43,7 @@ class Agent:
         self.max_turns = max_turns
         self.on_event = on_event or (lambda kind, payload: None)
         self.on_delta = on_delta
+        self._call_seq = 0        # 工具调用序号，供前端把 tool_start/tool_end 配对
 
     @property
     def messages(self) -> list[dict]:
@@ -90,7 +92,7 @@ class Agent:
                 self.ctx.add_tool_result(tc["id"], result,
                                          tool_name=tc["function"]["name"])
                 # 终止条件之：finish
-                if result.startswith(FINISH_MARKER):
+                if isinstance(result, str) and result.startswith(FINISH_MARKER):
                     finished_summary = result[len(FINISH_MARKER):].strip()
 
             if finished_summary is not None:
@@ -116,20 +118,29 @@ class Agent:
         except json.JSONDecodeError as e:
             return f"[error] 参数 JSON 解析失败: {e}"
 
-        self.on_event("tool_start", {"name": name, "args": args})
+        call_id = self._call_seq
+        self._call_seq += 1
+        self.on_event("tool_start", {"name": name, "args": args,
+                                     "call_id": call_id})
+        t0 = time.monotonic()
+
+        def _finish_ev(result_text: str) -> str:
+            self.on_event("tool_end", {
+                "name": name, "result": str(result_text),
+                "call_id": call_id,
+                "duration_ms": int((time.monotonic() - t0) * 1000),
+            })
+            return result_text
 
         # 安全检查（用户拒绝 => blocked；同样发事件，供 CLI 渲染/审计）
         if self.safety is not None and not self.safety.check(tool, args):
-            result = "[blocked] 用户拒绝了该操作，请换一种方式或询问用户。"
-            self.on_event("tool_end", {"name": name, "result": result})
-            return result
+            return _finish_ev("[blocked] 用户拒绝了该操作，请换一种方式或询问用户。")
 
         try:
             result = tool.execute(**args)
-        except TypeError as e:  # 参数签名不匹配（模型给错参数）
-            result = f"[error] 参数不合法: {e}"
-        except Exception as e:  # 工具内部异常兜底
-            result = f"[error] 工具执行异常: {type(e).__name__}: {e}"
-        self.on_event("tool_end", {"name": name, "result": result})
-
-        return result
+        except TypeError as e:      # 参数签名不匹配（模型给错参数）
+            return _finish_ev(f"[error] 参数不合法: {e}")
+        except Exception as e:      # 工具内部异常兜底
+            return _finish_ev(f"[error] 工具执行异常: {type(e).__name__}: {e}")
+        # 事件/序列化只吃字符串（ToolImageOutput.__str__ 返回其文本部分）
+        return _finish_ev(result)
