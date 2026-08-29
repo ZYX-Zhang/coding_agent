@@ -19,13 +19,13 @@ from .fs import (
     _safe_path,
 )
 from .shell import RunCommandTool
-from .todos import TodoTool
 from .interactive import AskUserTool, PlanTool
+from .net import FetchUrlTool
 
 __all__ = [
     "Tool", "ToolRegistry",
     "ReadFileTool", "WriteFileTool", "EditFileTool",
-    "ListDirTool", "SearchFilesTool", "TodoTool", "AskUserTool", "PlanTool",
+    "ListDirTool", "SearchFilesTool", "AskUserTool", "PlanTool", "FetchUrlTool",
     "RunCommandTool", "FinishTool", "FINISH_MARKER",
     "build_registry", "_safe_path",
 ]
@@ -44,4 +44,5 @@ def build_registry(workspace: str, llm=None, ask=None) -> ToolRegistry:
     reg.register(FinishTool())  # 7. 终止（不属于"手脚"，是出口）
     reg.register(PlanTool())  # 8. 任务计划管理
     reg.register(AskUserTool(ask))  # 9. 向用户提问
+    reg.register(FetchUrlTool())  # 10. 获取文档
     return reg
