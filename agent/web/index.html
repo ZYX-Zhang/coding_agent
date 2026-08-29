@@ -595,8 +595,11 @@ function handleEvent(e) {
 }
 
 /* ---------------- SSE / API ---------------- */
+/* 当前 SSE 连接句柄；新会话会换掉服务端事件总线，必须重连以重置游标 */
+let es = null;
 function connectSSE(after) {
-  const es = new EventSource("/api/events?after=" + after);
+  if (es) { try { es.close(); } catch (_) {} es = null; }
+  es = new EventSource("/api/events?after=" + after);
   es.onmessage = (ev) => {
     try {
       const e = JSON.parse(ev.data);
@@ -604,7 +607,10 @@ function connectSSE(after) {
       handleEvent(e);
     } catch (_) {}
   };
-  es.onerror = () => { es.close(); setTimeout(() => connectSSE(state.lastSeq), 1500); };
+  es.onerror = () => {
+    if (es) { try { es.close(); } catch (_) {} es = null; }
+    setTimeout(() => connectSSE(state.lastSeq), 1500);
+  };
 }
 
 async function refreshState() {
@@ -664,7 +670,10 @@ $("btn-new").onclick = async () => {
   state.turns = state.tools = state.denied = 0; state.lastSeq = -1;
   bump("st-turns", 0); bump("st-tools", 0); bump("st-denied", 0);
   $("st-elapsed").textContent = "0.0s";
-  refreshState();
+  await refreshState();
+  /* 关键修复：新会话会重建服务端事件总线并重置 seq，旧的 SSE 游标(after)
+     仍停在旧会话导致后续事件全部被丢弃。必须重连 SSE 让游标从新总线起点开始 */
+  connectSSE(state.lastSeq);
 };
 $("btn-auto").onclick = async () => {
   const r = await fetch("/api/auto", { method: "POST",
