@@ -19,11 +19,13 @@ from .fs import (
     _safe_path,
 )
 from .shell import RunCommandTool
+from .todos import TodoTool
+from .interactive import AskUserTool, PlanTool
 
 __all__ = [
     "Tool", "ToolRegistry",
     "ReadFileTool", "WriteFileTool", "EditFileTool",
-    "ListDirTool", "SearchFilesTool",
+    "ListDirTool", "SearchFilesTool", "TodoTool", "AskUserTool", "PlanTool",
     "RunCommandTool", "FinishTool", "FINISH_MARKER",
     "build_registry", "_safe_path",
 ]
@@ -40,4 +42,6 @@ def build_registry(workspace: str, llm=None, ask=None) -> ToolRegistry:
     reg.register(SearchFilesTool(workspace))  # 5. 找文件
     reg.register(RunCommandTool(workspace))  # 6. 执行命令
     reg.register(FinishTool())  # 7. 终止（不属于"手脚"，是出口）
+    reg.register(PlanTool())  # 8. 任务计划管理
+    reg.register(AskUserTool(ask))  # 9. 向用户提问
     return reg

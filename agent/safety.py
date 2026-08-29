@@ -14,7 +14,7 @@ import shlex
 # ---------------------------------------------------------------- #
 # 工具分级
 # ---------------------------------------------------------------- #
-READONLY_TOOLS = {"read_file", "list_dir", "search_files", "finish"}
+READONLY_TOOLS = {"read_file", "list_dir", "search_files", "finish", "ask_user", "plan"}
 CONFIRM_TOOLS = {"write_file", "edit_file", "run_command"}
 
 # ---------------------------------------------------------------- #
