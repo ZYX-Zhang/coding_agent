@@ -203,7 +203,7 @@ class WebApp:
             self.session.close()
         self.bus = EventBus()  # 事件流随会话重置
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         self.session = Session(self.session_dir / f"{ts}.jsonl")
         self.ctx = Context(system_prompt=build_system_prompt(self.workspace))
         self.safety = AutoSafety() if self.auto else WebSafety(self.bus)
@@ -218,6 +218,106 @@ class WebApp:
                            on_delta=lambda t: self.bus.publish("delta",
                                                                {"text": t}))
         self._saved_len = 0
+
+    # ---------------------------------------------------------------- #
+    def _replay_to_bus(self, msgs: list[dict]) -> None:
+        """把历史消息序列转成前端事件回放，使切换会话时 UI 能重建对话。"""
+        for m in msgs:
+            role = m.get("role")
+            if role == "user":
+                self.bus.publish("user", {"message": m.get("content", "")})
+            elif role == "assistant":
+                if m.get("content"):
+                    self.bus.publish("assistant", {"content": m["content"]})
+                for tc in (m.get("tool_calls") or []):
+                    fn = tc.get("function", {})
+                    self.bus.publish("tool_start", {
+                        "name": fn.get("name"),
+                        "args": fn.get("arguments"),
+                        "call_id": tc.get("id"),
+                    })
+            elif role == "tool":
+                self.bus.publish("tool_end", {
+                    "name": m.get("name"),
+                    "call_id": m.get("tool_call_id"),
+                    "result": m.get("content", ""),
+                    "duration_ms": 0,
+                })
+
+    def _switch_session(self, session_id: str) -> bool:
+        """切换到历史会话并恢复上下文，可继续对话（续跑）。"""
+        path = self.session_dir / session_id
+        if not path.exists() and not str(path).endswith(".jsonl"):
+            path = self.session_dir / (session_id + ".jsonl")
+        if not path.exists():
+            return False
+        self._flush_session()
+        if self.session:
+            self.session.close()
+        self.bus = EventBus()           # 事件流随会话重置
+        msgs = Session.load(path)
+        self.ctx = Context(system_prompt=build_system_prompt(self.workspace))
+        for m in msgs:
+            self.ctx.add_message(m)
+        self.safety = AutoSafety() if self.auto else WebSafety(self.bus)
+        self.web_ask = WebAsk(self.bus)
+        self.agent = Agent(self.llm,
+                           build_registry(self.workspace, llm=self.llm,
+                                          ask=self.web_ask.ask),
+                           context=self.ctx, safety=self.safety,
+                           max_turns=self.max_turns,
+                           on_event=lambda k, p: self.bus.publish(k, p),
+                           on_delta=lambda t: self.bus.publish("delta",
+                                                              {"text": t}))
+        self.session = Session(path)    # 继续追加到同一文件（续跑落盘）
+        self._saved_len = len(self.ctx.messages)
+        self._replay_to_bus(msgs)
+        self.bus.publish("session",
+                         {"message": f"已切换到会话 {path.stem}（可继续对话）"})
+        return True
+
+    def list_sessions(self) -> list[dict]:
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        items = []
+        for p in sorted(self.session_dir.glob("*.jsonl"),
+                        key=lambda x: x.stat().st_mtime, reverse=True):
+            try:
+                msgs = Session.load(p)
+            except Exception:
+                msgs = []
+            title = p.stem
+            for m in msgs:
+                if m.get("role") == "user":
+                    title = (m.get("content") or "").strip().split("\n")[0][:40]
+                    break
+            items.append({
+                "id": p.name,
+                "title": title,
+                "mtime": int(p.stat().st_mtime * 1000),
+                "messages": len(msgs),
+                "current": (self.session is not None
+                            and str(p.resolve()) == str(self.session.path.resolve())),
+            })
+        return items
+
+    def delete_session(self, session_id: str) -> dict:
+        path = self.session_dir / session_id
+        if not path.exists() and not str(path).endswith(".jsonl"):
+            path = self.session_dir / (session_id + ".jsonl")
+        if not path.exists():
+            return {"ok": False, "error": "会话不存在"}
+        is_current = (self.session is not None
+                      and str(path.resolve()) == str(self.session.path.resolve()))
+        try:
+            path.unlink()
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        if is_current:
+            self._flush_session()
+            self._new_session()
+            self.bus.publish("session",
+                             {"message": "已删除当前会话，已新建空白会话"})
+        return {"ok": True, "current_deleted": is_current}
 
     def set_auto(self, on: bool) -> None:
         """运行时切换自动确认（下一轮生效，pending 不受影响）。"""
@@ -336,6 +436,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_index()
         elif url.path == "/api/state":
             self._json(self.app.state())
+        elif url.path == "/api/sessions":
+            self._json(self.app.list_sessions())
         elif url.path == "/api/events":
             self._serve_sse(url)
         else:
@@ -397,6 +499,19 @@ class Handler(BaseHTTPRequestHandler):
             ok = self.app.web_ask.decide(int(body.get("id", -1)),
                                          str(body.get("answer", "")))
             self._json({"ok": ok}, 200 if ok else 404)
+        elif url.path == "/api/session/switch":
+            if self.app.running:
+                self._json({"ok": False, "error": "任务运行中，不能切换"}, 409)
+                return
+            sid = str(body.get("id", ""))
+            ok = self.app._switch_session(sid)
+            self._json({"ok": ok}, 200 if ok else 404)
+        elif url.path == "/api/session/delete":
+            if self.app.running:
+                self._json({"ok": False, "error": "任务运行中，不能删除"}, 409)
+                return
+            sid = str(body.get("id", ""))
+            self._json(self.app.delete_session(sid))
         elif url.path == "/api/new":
             if self.app.running:
                 self._json({"ok": False, "error": "任务运行中，不能新建"}, 409)

@@ -21,7 +21,52 @@
   body {
     background: var(--bg); color: var(--fg);
     font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-    display: flex; flex-direction: column; overflow: hidden;
+    display: flex; flex-direction: row; overflow: hidden;
+  }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100%; }
+
+  /* ---------- 左侧栏：会话列表 ---------- */
+  #sidebar {
+    width: 248px; flex-shrink: 0; background: var(--panel);
+    border-right: 1px solid var(--line); display: flex;
+    flex-direction: column; overflow: hidden;
+  }
+  .sb-top {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; padding: 12px 12px 10px; border-bottom: 1px solid var(--line);
+  }
+  .sb-title { font-size: 12.5px; color: var(--dim); letter-spacing: .5px; }
+  #btn-new {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 7px; padding: 5px 11px; font-size: 12.5px; cursor: pointer;
+  }
+  #btn-new:hover { border-color: var(--info); }
+  #sess-list {
+    list-style: none; flex: 1; overflow-y: auto; margin: 0; padding: 8px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .sess {
+    position: relative; padding: 9px 30px 9px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel2); cursor: pointer;
+  }
+  .sess:hover { border-color: var(--info); }
+  .sess.active { border-color: var(--model); background: rgba(167,139,250,.10); }
+  .sess-title {
+    font-size: 13px; color: var(--fg); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .sess-meta { font-size: 11px; color: var(--faint); margin-top: 3px; }
+  .sess-del {
+    position: absolute; top: 7px; right: 7px; width: 20px; height: 20px;
+    line-height: 18px; text-align: center; padding: 0; border-radius: 5px;
+    border: 1px solid var(--line); background: transparent; color: var(--dim);
+    cursor: pointer; font-size: 12px;
+  }
+  .sess-del:hover { border-color: var(--err); color: var(--err); }
+  .sb-foot {
+    padding: 8px 12px; border-top: 1px solid var(--line); font-size: 11px;
+    color: var(--faint); white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   /* ---------- 顶栏 ---------- */
@@ -286,6 +331,16 @@
 </head>
 <body>
 
+<aside id="sidebar">
+  <div class="sb-top">
+    <div class="sb-title">会话</div>
+    <button id="btn-new">＋ 新会话</button>
+  </div>
+  <ul id="sess-list"></ul>
+  <div class="sb-foot" id="sb-ws">—</div>
+</aside>
+
+<div id="main">
 <header>
   <div class="brand"><b>⚡ CodingAgent</b><span>workbench</span></div>
   <div class="meta">
@@ -295,7 +350,6 @@
   </div>
   <div class="spacer"></div>
   <button id="btn-auto" title="写操作不再逐项询问（高危命令仍拦截）">确认模式</button>
-  <button id="btn-new">＋ 新会话</button>
 </header>
 
 <div id="statsbar">
@@ -317,6 +371,7 @@
   </div>
   <div id="hint">写操作默认需确认（y 允许 · n 拒绝 · a 本次会话全部允许）</div>
 </div>
+</div><!-- /#main -->
 
 <script>
 "use strict";
@@ -351,6 +406,7 @@ function renderModelMarkdown(bubble) {
 
 const state = {
   running: false, auto: false, turns: 0, tools: 0, denied: 0,
+  replaying: false,
   taskT0: null, timer: null, lastSeq: -1,
   modelEl: null,          // 当前流式模型气泡
   toolCards: new Map(),   // call_id -> 卡片元素
@@ -615,10 +671,14 @@ let lastTokens = 0;
 function handleEvent(e) {
   const k = e.kind, p = e.payload || {};
   switch (k) {
-    case "user":        addUserMsg(p.message); setRunning(true);
-                        state.turns = state.tools = 0;
-                        bump("st-turns", 0); bump("st-tools", 0);
-                        $("st-elapsed").textContent = "0.0s"; break;
+    case "user":        addUserMsg(p.message);
+                        if (!state.replaying) {
+                          setRunning(true);
+                          state.turns = state.tools = 0;
+                          bump("st-turns", 0); bump("st-tools", 0);
+                          $("st-elapsed").textContent = "0.0s";
+                        }
+                        break;
     case "turn_start":  addTurnDivider(p.turn); break;
     case "delta":       { const b = ensureModelBubble();
                           b.querySelector(".txt").textContent += p.text;
@@ -644,9 +704,11 @@ function handleEvent(e) {
     case "warning":    feed.appendChild(el(
                          `<div class="alert warning">⚠ ${esc(p.message)}</div>`));
                        scrollDown(); break;
-    case "session":    feed.appendChild(el(
+    case "session":    state.replaying = false;
+                       feed.appendChild(el(
                          `<div class="alert session">— ${esc(p.message)} —</div>`));
-                       scrollDown(); break;
+                       scrollDown();
+                       if (!state.running) setRunning(false); break;
     case "finish":     break;   /* 摘要在 task_end 里统一出 */
     case "task_end":   if (p.summary) addFinish(p);
                        else { setRunning(false); }
@@ -679,11 +741,14 @@ function connectSSE(after) {
   };
 }
 
-async function refreshState() {
+async function refreshState(opts) {
+  opts = opts || {};
+  const replayEvents = opts.replayEvents !== false && state.lastSeq < 0;
   try {
     const st = await (await fetch("/api/state")).json();
     $("h-model").textContent = st.model;
     $("h-ws").textContent = st.workspace.split("/").pop() || st.workspace;
+    $("sb-ws").textContent = st.workspace.split("/").pop() || st.workspace;
     $("h-session").textContent = (st.stats.session_file || "").split("/").pop() || "—";
     state.auto = st.auto;
     const ab = $("btn-auto");
@@ -696,8 +761,8 @@ async function refreshState() {
     if (st.stats.turns && !state.running) bump("st-turns", st.stats.turns);
     if (st.stats.elapsed_ms && !state.running)
       $("st-elapsed").textContent = fmtMs(st.stats.elapsed_ms);
-    /* 回放历史事件（页面刷新后） */
-    if (state.lastSeq < 0 && st.events && st.events.length) {
+    /* 回放历史事件（页面刷新后）。切换/删除会话时由 SSE 回放，不在此处以免双重 */
+    if (replayEvents && st.events && st.events.length) {
       st.events.forEach(handleEvent);
       state.lastSeq = st.events[st.events.length - 1].seq;
       if (!st.running) setRunning(false);
@@ -717,6 +782,62 @@ async function send() {
     feed.appendChild(el(`<div class="alert error">✘ ${esc(j.message || "提交失败")}</div>`));
     scrollDown(true);
   }
+}
+
+/* ---------------- 会话列表：展示 / 切换 / 删除 ---------------- */
+async function loadSessions() {
+  try {
+    const list = await (await fetch("/api/sessions")).json();
+    const ul = $("sess-list");
+    ul.innerHTML = "";
+    list.forEach((s) => {
+      const li = document.createElement("li");
+      li.className = "sess" + (s.current ? " active" : "");
+      const t = document.createElement("div");
+      t.className = "sess-title"; t.textContent = s.title;
+      const mt = document.createElement("div");
+      mt.className = "sess-meta";
+      mt.textContent = s.messages + " 条 · " + new Date(s.mtime).toLocaleString();
+      li.appendChild(t); li.appendChild(mt);
+      li.onclick = () => switchSession(s.id);
+      const del = document.createElement("button");
+      del.className = "sess-del"; del.textContent = "✕"; del.title = "删除会话";
+      del.onclick = (e) => { e.stopPropagation(); deleteSession(s.id); };
+      li.appendChild(del);
+      ul.appendChild(li);
+    });
+  } catch (_) {}
+}
+
+async function switchSession(id) {
+  if (state.running) return;
+  await fetch("/api/session/switch", { method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({ id }) });
+  feed.innerHTML = ""; state.toolCards.clear();
+  state.confirmCards.clear(); state.askCards.clear();
+  state.turns = state.tools = state.denied = 0; state.lastSeq = -1;
+  bump("st-turns", 0); bump("st-tools", 0); bump("st-denied", 0);
+  $("st-elapsed").textContent = "0.0s";
+  state.replaying = true;
+  await refreshState({ replayEvents: false });
+  connectSSE(state.lastSeq);
+  loadSessions();
+}
+
+async function deleteSession(id) {
+  if (state.running) return;
+  const j = await (await fetch("/api/session/delete", { method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({ id }) })).json();
+  if (j.current_deleted) {
+    feed.innerHTML = ""; state.toolCards.clear();
+    state.confirmCards.clear(); state.askCards.clear();
+    state.turns = state.tools = state.denied = 0; state.lastSeq = -1;
+    bump("st-turns", 0); bump("st-tools", 0); bump("st-denied", 0);
+    $("st-elapsed").textContent = "0.0s";
+    await refreshState({ replayEvents: false });
+    connectSSE(state.lastSeq);
+  }
+  loadSessions();
 }
 
 /* ---------------- 交互绑定 ---------------- */
@@ -740,6 +861,7 @@ $("btn-new").onclick = async () => {
   /* 关键修复：新会话会重建服务端事件总线并重置 seq，旧的 SSE 游标(after)
      仍停在旧会话导致后续事件全部被丢弃。必须重连 SSE 让游标从新总线起点开始 */
   connectSSE(state.lastSeq);
+  loadSessions();
 };
 $("btn-auto").onclick = async () => {
   const r = await fetch("/api/auto", { method: "POST",
@@ -753,8 +875,9 @@ $("btn-auto").onclick = async () => {
 };
 
 /* ---------------- 启动 ---------------- */
-refreshState().then(() => connectSSE(state.lastSeq));
+refreshState().then(() => { connectSSE(state.lastSeq); loadSessions(); });
 setInterval(refreshState, 5000);
+setInterval(loadSessions, 5000);
 input.focus();
 </script>
 </body>
