@@ -21,12 +21,13 @@ from .fs import (
 from .shell import RunCommandTool
 from .interactive import AskUserTool, PlanTool
 from .net import FetchUrlTool
+from .search import SearchCodeTool
 
 __all__ = [
     "Tool", "ToolRegistry",
     "ReadFileTool", "WriteFileTool", "EditFileTool",
     "ListDirTool", "SearchFilesTool", "AskUserTool", "PlanTool", "FetchUrlTool",
-    "RunCommandTool", "FinishTool", "FINISH_MARKER",
+    "SearchCodeTool", "RunCommandTool", "FinishTool", "FINISH_MARKER",
     "build_registry", "_safe_path",
 ]
 
@@ -45,4 +46,5 @@ def build_registry(workspace: str, llm=None, ask=None) -> ToolRegistry:
     reg.register(PlanTool())  # 8. 任务计划管理
     reg.register(AskUserTool(ask))  # 9. 向用户提问
     reg.register(FetchUrlTool())  # 10. 获取文档
+    reg.register(SearchCodeTool(workspace))  # 11.  按内容找（正则）
     return reg
