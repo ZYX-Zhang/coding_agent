@@ -191,11 +191,6 @@ class WebApp:
         self.cancelled = False              # 协作式取消标志（stop 置位）
         self._run_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None  # 当前后台任务线程
-        # 让 LLM 客户端在用户点停止时立即中断流式调用（见 llm.LLMCancelled）
-        try:
-            self.llm.should_cancel = lambda: self.cancelled
-        except Exception:
-            pass
         self.safety: WebSafety | AutoSafety | None = None
         self.session: Session | None = None
         self._saved_len = 0
@@ -311,6 +306,29 @@ class WebApp:
             })
         return items
 
+    def view_session(self, session_id: str) -> dict | None:
+        """只读查看某个历史会话的内容（不切换、不修改任何运行状态）。
+
+        即使当前有任务在跑也安全：它不触碰 self.ctx / self.agent / self.bus，
+        仅读取目标会话文件并返回消息列表，供前端以「只读快照」形式渲染，
+        从而支持「一个会话执行时查看其他历史会话」。
+        """
+        path = self.session_dir / session_id
+        if not path.exists() and not str(path).endswith(".jsonl"):
+            path = self.session_dir / (session_id + ".jsonl")
+        if not path.exists():
+            return None
+        try:
+            msgs = Session.load(path)
+        except Exception:
+            msgs = []
+        title = path.stem
+        for m in msgs:
+            if m.get("role") == "user":
+                title = (m.get("content") or "").strip().split("\n")[0][:40]
+                break
+        return {"id": path.name, "title": title, "messages": msgs}
+
     def delete_session(self, session_id: str) -> dict:
         path = self.session_dir / session_id
         if not path.exists() and not str(path).endswith(".jsonl"):
@@ -344,9 +362,6 @@ class WebApp:
         新任务真正开始的前提是上一任 agent.run 已彻底退出，因此绝不会有两个
         agent.run 并发写同一份 ctx，从根上杜绝会话历史错乱，也无需任何"在后台
         join 旧任务"的阻塞（那正是之前卡顿/不显示任务的根因）。
-
-        停止后的退场很快（LLM 流每片检查取消、命令每 0.1s 轮询取消并杀进程树、
-        llm 看门狗兜底网络停滞），通常 < 1s，用户几乎无感。
         """
         import time as _time
         old = self._worker_thread
@@ -367,12 +382,10 @@ class WebApp:
     def cancel_task(self) -> bool:
         """停止当前任务（协作式取消）。
 
-        仅置位 cancelled 标志，让：
-          · Agent 主循环在每轮顶部、每个工具执行前检查而主动终止；
-          · 正在进行的 LLM 流式调用在 _chat_stream 每片（或看门狗超时）检查后
-            中断并抛 LLMCancelled；
-          · 正在跑的命令被 run_cancellable 杀进程树。
-        因此任务几乎瞬间结束，且取消前的文件改动/会话历史全部保留、可续跑。
+        仅置位 cancelled 标志，由 Agent 主循环在「下一轮模型调用之前」与
+        「每一个工具执行之前」检查而主动终止——当前正在进行的模型生成 / 工具
+        会先跑完，再于下一个步骤边界干净收尾。取消前的文件改动与会话历史全部
+        保留，取消后用户可立即输入新任务从该会话续跑。
 
         注意：这里不把 running 置 False——改由 worker 的 finally 收尾。这样在退场
         期间 start_task 的「worker 存活」守卫持续返回 409，新任务会等旧 worker 真正
@@ -481,12 +494,20 @@ class Handler(BaseHTTPRequestHandler):
     # ---- GET ---- #
     def do_GET(self):
         url = urlsplit(self.path)
+        qs = parse_qs(url.query)
         if url.path in ("/", "/index.html"):
             self._serve_index()
         elif url.path == "/api/state":
             self._json(self.app.state())
         elif url.path == "/api/sessions":
             self._json(self.app.list_sessions())
+        elif url.path == "/api/session/view":
+            sid = qs.get("id", [""])[0]
+            data = self.app.view_session(sid)
+            if data is None:
+                self._json({"error": "会话不存在"}, 404)
+            else:
+                self._json(data)
         elif url.path == "/api/events":
             self._serve_sse(url)
         else:
@@ -556,9 +577,8 @@ class Handler(BaseHTTPRequestHandler):
             ok = self.app._switch_session(sid)
             self._json({"ok": ok}, 200 if ok else 404)
         elif url.path == "/api/session/delete":
-            if self.app.running:
-                self._json({"ok": False, "error": "任务运行中，不能删除"}, 409)
-                return
+            # 放行：运行中也能删除「其他」历史会话（只读文件，不影响正在跑的任务）；
+            # 只有删除「当前正在运行」的会话会被 delete_session 内部拒绝。
             sid = str(body.get("id", ""))
             self._json(self.app.delete_session(sid))
         elif url.path == "/api/new":

@@ -51,6 +51,7 @@
   }
   .sess:hover { border-color: var(--info); }
   .sess.active { border-color: var(--model); background: rgba(167,139,250,.10); }
+  .sess.viewing { border-color: var(--info); background: rgba(96,165,250,.10); }
   .sess-title {
     font-size: 13px; color: var(--fg); white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis;
@@ -432,6 +433,8 @@ const state = {
   running: false, auto: false, turns: 0, tools: 0, denied: 0,
   replaying: false, stopped: false,   // stopped: 已点停止，等待旧任务收尾中
   discardUntilTaskEnd: false,          // 停止后丢弃旧任务继续冒出的 delta/assistant
+  viewingOther: null,    // 非空 = 正在以「只读快照」查看该 id 的其他历史会话
+  currentId: null,       // 当前正在执行的会话 id（由侧栏列表标记）
   taskT0: null, timer: null, lastSeq: -1,
   modelEl: null,          // 当前流式模型气泡
   toolCards: new Map(),   // call_id -> 卡片元素
@@ -726,6 +729,9 @@ function addFinish(p) {
 let lastTokens = 0;
 
 function handleEvent(e) {
+  /* 只读查看其他历史会话时，忽略实时事件（它们属于正在运行的当前会话，
+     若混入快照会错乱）；返回当前会话后会通过重连 SSE 从总线回放补齐 */
+  if (state.viewingOther) return;
   const k = e.kind, p = e.payload || {};
   switch (k) {
     case "user":        addUserMsg(p.message);
@@ -852,6 +858,13 @@ function removeStoppingHint() {
 }
 async function send() {
   if (submitting) return;          // 已有提交在进行中，忽略本次
+  /* 只读查看其他会话时，先返回当前会话再发送，避免把消息投到错误会话 */
+  if (state.viewingOther) {
+    feed.appendChild(el(
+      `<div class="alert warning">⚠ 正在查看其他会话，请先点「返回当前会话」再发送</div>`));
+    scrollDown(true);
+    return;
+  }
   const text = input.value.trim();
   if (!text || state.running) return;
   /* 协作式取消：停止后旧任务会在"下一个步骤边界"前终止，期间可能仍需数秒
@@ -887,8 +900,10 @@ async function loadSessions() {
     const ul = $("sess-list");
     ul.innerHTML = "";
     list.forEach((s) => {
+      if (s.current) state.currentId = s.id;
       const li = document.createElement("li");
-      li.className = "sess" + (s.current ? " active" : "");
+      li.className = "sess" + (s.current ? " active" : "")
+                    + (s.id === state.viewingOther ? " viewing" : "");
       const t = document.createElement("div");
       t.className = "sess-title"; t.textContent = s.title;
       const mt = document.createElement("div");
@@ -905,8 +920,70 @@ async function loadSessions() {
   } catch (_) {}
 }
 
+/* 以「只读快照」渲染某个历史会话的消息，不触发任何运行状态变更 */
+function renderHistoryMessage(m) {
+  const role = m.role;
+  if (role === "user") {
+    addUserMsg(m.content || "");
+  } else if (role === "assistant") {
+    const c = m.content || "";
+    if (c) {
+      const b = ensureModelBubble();
+      b.querySelector(".txt").textContent = c;
+      closeModelBubble();
+    }
+    for (const tc of (m.tool_calls || [])) {
+      const fn = tc.function || {};
+      toolCard({ name: fn.name, args: fn.arguments, call_id: tc.id });
+    }
+  } else if (role === "tool") {
+    renderToolEnd({ name: m.name, call_id: m.tool_call_id,
+                    result: m.content || "", duration_ms: 0 });
+  }
+}
+
+/* 只读查看其他历史会话：不改后端运行状态，仅拉取快照渲染；
+   实时事件在 viewingOther 期间被 handleEvent 忽略，避免污染快照 */
+async function viewSession(id) {
+  try {
+    const r = await fetch("/api/session/view?id=" + encodeURIComponent(id));
+    if (!r.ok) return;
+    const data = await r.json();
+    state.viewingOther = id;
+    feed.innerHTML = ""; state.toolCards.clear();
+    state.confirmCards.clear(); state.askCards.clear();
+    (data.messages || []).forEach(renderHistoryMessage);
+    const banner = el(
+      `<div class="alert session" id="view-banner">👁 正在查看历史会话「${esc(data.title)}」`
+      + (state.running ? "（当前会话运行中）" : "")
+      + ` · <a href="#" id="return-cur" style="color:var(--info);text-decoration:none;">返回当前会话</a></div>`);
+    feed.appendChild(banner);
+    scrollDown(true);
+    const rc = $("return-cur");
+    if (rc) rc.onclick = (e) => { e.preventDefault(); returnToCurrent(); };
+  } catch (_) {}
+}
+
+/* 退出只读查看，回到当前会话（从事件总线回放最新状态） */
+async function returnToCurrent() {
+  state.viewingOther = null;
+  feed.innerHTML = ""; state.toolCards.clear();
+  state.confirmCards.clear(); state.askCards.clear();
+  state.turns = state.tools = state.denied = 0; state.lastSeq = -1;
+  bump("st-turns", 0); bump("st-tools", 0); bump("st-denied", 0);
+  $("st-elapsed").textContent = "0.0s";
+  state.replaying = true;
+  await refreshState({ replayEvents: true });
+  connectSSE(state.lastSeq);
+  loadSessions();
+}
+
 async function switchSession(id) {
-  if (state.running) return;
+  /* 正在查看其他历史会话时，点击左侧高亮的当前会话 → 返回当前会话 */
+  if (state.viewingOther && id === state.currentId) { returnToCurrent(); return; }
+  /* 运行中且查看的是「其他」会话 → 只读快照，不动当前运行的任务 */
+  if (state.running && id !== state.currentId) { viewSession(id); return; }
+  if (state.running) return;                 // 运行中点击当前会话：忽略
   await fetch("/api/session/switch", { method: "POST",
     headers: {"Content-Type": "application/json"}, body: JSON.stringify({ id }) });
   feed.innerHTML = ""; state.toolCards.clear();
@@ -921,9 +998,12 @@ async function switchSession(id) {
 }
 
 async function deleteSession(id) {
-  if (state.running) return;
   const j = await (await fetch("/api/session/delete", { method: "POST",
     headers: {"Content-Type": "application/json"}, body: JSON.stringify({ id }) })).json();
+  if (!j.ok && j.error) {
+    feed.appendChild(el(`<div class="alert warning">⚠ ${esc(j.error)}</div>`));
+    scrollDown(true);
+  }
   if (j.current_deleted) {
     feed.innerHTML = ""; state.toolCards.clear();
     state.confirmCards.clear(); state.askCards.clear();
@@ -966,6 +1046,7 @@ input.addEventListener("input", () => {
 $("btn-new").onclick = async () => {
   if (state.running) return;
   await fetch("/api/new", { method: "POST" });
+  state.viewingOther = null;
   feed.innerHTML = ""; state.toolCards.clear();
   state.confirmCards.clear(); state.askCards.clear();
   state.turns = state.tools = state.denied = 0; state.lastSeq = -1;
