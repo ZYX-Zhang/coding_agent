@@ -218,8 +218,10 @@ class WebApp:
                            context=self.ctx, safety=self.safety,
                            max_turns=self.max_turns,
                            on_event=lambda k, p: self.bus.publish(k, p),
-                           on_delta=lambda t: self.bus.publish("delta",
-                                                              {"text": t}),
+                           on_delta=lambda t, k="content":
+                               self.bus.publish(
+                                   "reasoning" if k == "reasoning" else "delta",
+                                   {"text": t}),
                            should_cancel=lambda: self.cancelled)
         self._saved_len = 0
 
@@ -272,8 +274,10 @@ class WebApp:
                            context=self.ctx, safety=self.safety,
                            max_turns=self.max_turns,
                            on_event=lambda k, p: self.bus.publish(k, p),
-                           on_delta=lambda t: self.bus.publish("delta",
-                                                              {"text": t}),
+                           on_delta=lambda t, k="content":
+                               self.bus.publish(
+                                   "reasoning" if k == "reasoning" else "delta",
+                                   {"text": t}),
                            should_cancel=lambda: self.cancelled)
         self.session = Session(path)    # 继续追加到同一文件（续跑落盘）
         self._saved_len = len(self.ctx.messages)

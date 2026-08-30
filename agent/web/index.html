@@ -140,6 +140,23 @@
             vertical-align: text-bottom; }
   @keyframes blink { 50% { opacity: 0; } }
 
+  /* 思考链折叠块：与正文区分，默认展开可见，可手动收起避免刷屏 */
+  .msg-model details.reasoning {
+    border-left: 2px solid var(--faint);
+    background: rgba(255,255,255,.02);
+    border-radius: 6px; margin: 2px 0 6px; padding: 0;
+  }
+  .msg-model details.reasoning summary {
+    cursor: pointer; color: var(--faint); font-size: 11.5px;
+    padding: 3px 8px; list-style: none; user-select: none;
+  }
+  .msg-model details.reasoning summary::-webkit-details-marker { display: none; }
+  .msg-model details.reasoning summary::before { content: "▸ "; }
+  .msg-model details.reasoning[open] summary::before { content: "▾ "; }
+  .msg-model details.reasoning > .md {
+    padding: 0 8px 4px; color: var(--dim); font-size: 12.5px;
+  }
+
   /* ---------- Markdown 渲染区 ---------- */
   .md { color: var(--fg); font-size: 13.5px; line-height: 1.65;
         white-space: normal; word-break: break-word; }
@@ -417,6 +434,20 @@ function mdHtml(text) {
 /* 把模型气泡里累积的纯文本渲染为 markdown（仅在关闭/收尾时做一次，避免流式闪烁） */
 function renderModelMarkdown(bubble) {
   if (!bubble || bubble._md) return;
+  /* 思考链块：先渲染为 markdown（可能有代码/列表） */
+  const rt = bubble.querySelector(".r-txt");
+  if (rt && rt.textContent.trim()) {
+    const box = document.createElement("div");
+    box.innerHTML = mdHtml(rt.textContent);
+    const node = box.firstChild;
+    if (node) rt.replaceWith(node);
+    else rt.remove();
+  } else if (rt) {
+    rt.remove();                       // 空思考块：连同 details 一起清掉
+    const rb = bubble.querySelector("details.reasoning");
+    if (rb) rb.remove();
+  }
+  /* 正文块 */
   const txt = bubble.querySelector(".txt");
   if (!txt) return;
   const raw = txt.textContent;
@@ -745,14 +776,42 @@ function handleEvent(e) {
                         break;
     case "turn_start":  addTurnDivider(p.turn); break;
     case "delta":       if (state.discardUntilTaskEnd) break;
-                          { const b = ensureModelBubble();
-                            b.querySelector(".txt").textContent += p.text;
+                          { const t = String(p.text || "");
+                            // 跳过空/纯空白增量：避免 API 下发空片时产生空白气泡
+                            if (!t.trim()) break;
+                            const b = ensureModelBubble();
+                            b.querySelector(".txt").textContent += t;
                             scrollDown(); break; }
     case "assistant":   if (state.discardUntilTaskEnd) break;
-                          { const txt = p.content || "";
-                            if (txt) { const b = ensureModelBubble();
-                                       const t = b.querySelector(".txt");
-                                       if (!t.textContent) t.textContent = txt; }
+                          { const b = ensureModelBubble();
+                            // 思考链兜底（流式未覆盖时，用最终 reasoning 填充折叠块）
+                            const rtxt = p.reasoning || "";
+                            if (rtxt) {
+                              let rb = b.querySelector("details.reasoning");
+                              if (!rb) {
+                                rb = el(`<details class="reasoning" open>` +
+                                        `<summary>💭 模型思考中…</summary>` +
+                                        `<div class="r-txt"></div></details>`);
+                                const txt = b.querySelector(".txt");
+                                b.insertBefore(rb, txt);
+                              }
+                              const rt = b.querySelector(".r-txt");
+                              if (!rt.textContent.trim()) rt.textContent = rtxt;
+                            }
+                            const txt = p.content || "";
+                            if (txt) {
+                              const t = b.querySelector(".txt");
+                              if (!t.textContent.trim()) t.textContent = txt;
+                            } else if ((p.tool_calls || []).length) {
+                              // 模型没出正文但有工具调用：补一句“思考/意图”提示，避免空气泡
+                              const t = b.querySelector(".txt");
+                              if (!t.textContent.trim()) {
+                                const names = p.tool_calls
+                                  .map(tc => ((tc.function || {}).name || tc.name || "?"))
+                                  .filter(Boolean).join("、");
+                                t.textContent = `🤔 我需要调用工具${names ? "：" + names : "…"}`;
+                              }
+                            }
                             closeModelBubble(); scrollDown(); break; }
     case "tool_start":  toolCard(p); scrollDown(); break;
     case "tool_end":    renderToolEnd(p); break;

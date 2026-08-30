@@ -17,6 +17,19 @@ import os
 import time
 from .config import api_key, model, url
 
+def _emit_delta(on_delta, text: str, kind: str = "content") -> None:
+    """安全地把流式增量上抛给 on_delta。
+
+    - 优先按 (text, kind) 双参调用：kind ∈ {"content", "reasoning"}，
+      便于上层（如 Web 前端）区分「正文」与「思考链」分别渲染。
+    - 若回调只接受单参（如 CLI 的打字机输出 on_delta(text)），自动降级为
+      on_delta(text)，保证旧签名不被破坏、真实流式也不会因 TypeError 崩溃。
+    """
+    try:
+        on_delta(text, kind)
+    except TypeError:
+        on_delta(text)
+
 
 class LLMError(Exception):
     """重试耗尽后的最终错误，由调用方（CLI/Agent 外层）兜底。"""
@@ -69,8 +82,9 @@ class LLMClient:
                 if attempt < self.max_retries:
                     wait = 2 ** attempt  # 2s, 4s, 8s 退避
                     if on_delta:
-                        on_delta(f"\n[网络波动，{wait}s 后重试 ({attempt}/"
-                                 f"{self.max_retries})…]")
+                        _emit_delta(on_delta,
+                                    f"\n[网络波动，{wait}s 后重试 ({attempt}/"
+                                    f"{self.max_retries})…]", "content")
                     time.sleep(wait)
         raise LLMError(f"调用 {self.model} 连续失败 {self.max_retries} 次: "
                        f"{last_err}")
@@ -83,6 +97,7 @@ class LLMClient:
         return {
             "role": "assistant",
             "content": msg.content or "",
+            "reasoning": getattr(msg, "reasoning_content", None) or "",
             "tool_calls": [
                 {"id": tc.id, "type": "function",
                  "function": {"name": tc.function.name,
@@ -106,7 +121,8 @@ class LLMClient:
         stream = self.client.chat.completions.create(**kwargs)
 
         content_parts: list[str] = []
-        tc_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
+        reasoning_parts: list[str] = []      # 思考链（部分模型流式下发）
+        tc_acc: dict[int, dict] = {}       # index -> {id, name, arguments}
         usage = None
 
         for chunk in stream:
@@ -120,7 +136,13 @@ class LLMClient:
 
             if delta.content:
                 content_parts.append(delta.content)
-                on_delta(delta.content)
+                _emit_delta(on_delta, delta.content, "content")
+
+            # 智谱部分模型（如 GLM-4-AirX/GLM-Z1）把思考链放在 reasoning_content
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+                _emit_delta(on_delta, reasoning, "reasoning")
 
             for tc in (delta.tool_calls or []):
                 acc = tc_acc.setdefault(tc.index, {"id": "", "name": "",
@@ -136,6 +158,7 @@ class LLMClient:
         return {
             "role": "assistant",
             "content": "".join(content_parts),
+            "reasoning": "".join(reasoning_parts),
             "tool_calls": [
                 {"id": acc["id"] or f"call_{i}", "type": "function",
                  "function": {"name": acc["name"],
