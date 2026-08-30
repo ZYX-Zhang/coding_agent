@@ -455,8 +455,12 @@ function fmtTokens(n) {
 function nearBottom() {
   return chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 120;
 }
+/* 自动跟随：内容生成时滚到底部，但用户主动上滑查看历史时不强行拉回；
+   用户滚回底部附近即恢复跟随。比每次都测 nearBottom 更稳定。 */
+let autoFollow = true;
+chatEl.addEventListener("scroll", () => { autoFollow = nearBottom(); });
 function scrollDown(force) {
-  if (force || nearBottom()) chatEl.scrollTop = chatEl.scrollHeight;
+  if (force || autoFollow) chatEl.scrollTop = chatEl.scrollHeight;
 }
 function briefArgs(name, args) {
   if (!args || typeof args !== "object") return "";
