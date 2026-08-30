@@ -234,6 +234,13 @@
   .badge.warn { color: var(--warn); border-color: var(--warn);
                 background: rgba(251,191,36,.08); }
 
+  /* diff 行数统计：所有 diff 都展示，类似 git 的实心绿/红 */
+  .diff-sum { display: flex; gap: 8px; padding: 8px 12px 2px; flex-wrap: wrap; }
+  .diff-sum .badge.add { color: #e6ffec; border-color: #2ea043;
+                         background: #238636; }
+  .diff-sum .badge.del { color: #ffebe9; border-color: #f85149;
+                         background: #da3633; }
+
   /* 安全确认（琥珀） */
   .card-confirm {
     border: 1px solid var(--warn); background: rgba(251,191,36,.06);
@@ -511,6 +518,28 @@ function toolCard(p) {
   return card;
 }
 
+/* 构建 unified diff 高亮（按行着色）。maxLines 为 null 时输出全部；
+   否则只渲染色前 maxLines 行（用于折叠预览） */
+function buildDiffBody(text, maxLines) {
+  const lines = text.split("\n");
+  const holder = document.createElement("div");
+  lines.forEach((ln, i) => {
+    let c = "";
+    if (ln.startsWith("+++") || ln.startsWith("---")) c = "meta";
+    else if (ln.startsWith("@@")) c = "hunk";
+    else if (ln.startsWith("+")) c = "add";
+    else if (ln.startsWith("-")) c = "del";
+    if (i === 0 || c) {                       // 始终保留首行 + 着色行
+      if (maxLines != null && i >= maxLines) return;
+      const sp = document.createElement("span");
+      sp.className = "diff-line " + c;
+      sp.textContent = ln;
+      holder.appendChild(sp);
+    }
+  });
+  return holder;
+}
+
 function renderToolEnd(p) {
   const id = (p.call_id !== undefined) ? p.call_id : "k" + state.tools;
   const card = state.toolCards.get(id) || (() => {
@@ -553,25 +582,29 @@ function renderToolEnd(p) {
     }
   }
 
-  /* diff 高亮（edit_file 的 unified diff） */
+  /* diff 高亮（edit_file / apply_patch 的 unified diff） */
   if (result.includes("\n@@") || result.includes("@@ ")) {
     const lines = result.split("\n");
-    const box = el(`<div class="tool-body"></div>`);
-    const holder = document.createElement("div");
-    lines.forEach((ln, i) => {
-      let c = "";
-      if (ln.startsWith("+++") || ln.startsWith("---")) c = "meta";
-      else if (ln.startsWith("@@")) c = "hunk";
-      else if (ln.startsWith("+")) c = "add";
-      else if (ln.startsWith("-")) c = "del";
-      if (i === 0 || c) {
-        const sp = document.createElement("span");
-        sp.className = "diff-line " + c;
-        sp.textContent = ln;
-        holder.appendChild(sp);
-      }
-    });
-    body.appendChild(holder);
+    const addN = lines.filter(l => l.startsWith("+") && !l.startsWith("+++")).length;
+    const delN = lines.filter(l => l.startsWith("-") && !l.startsWith("---")).length;
+    const PREVIEW = 20;                       // 默认预览前 20 行
+    /* 行数统计徽章：所有 diff 都展示（不止折叠时） */
+    body.appendChild(el(
+      `<div class="diff-sum">` +
+      `<span class="badge add">+${addN} 新增</span>` +
+      `<span class="badge del">-${delN} 删除</span>` +
+      `</div>`));
+    if (lines.length <= PREVIEW) {
+      body.appendChild(buildDiffBody(result, null));
+    } else {
+      body.appendChild(buildDiffBody(result, PREVIEW));
+      const det = el(
+        `<details class="fold">` +
+        `<summary>展开完整 Diff（共 ${lines.length} 行）</summary>` +
+        `</details>`);
+      det.appendChild(buildDiffBody(result, null));
+      body.appendChild(det);
+    }
   } else if (result) {
     /* 普通文本输出：markdown 渲染 + 长输出折叠 */
     const lines = result.split("\n");
