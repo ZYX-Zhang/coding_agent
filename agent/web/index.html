@@ -291,6 +291,8 @@
                    background: rgba(251,191,36,.07); }
   .alert.session { border-color: var(--line); color: var(--dim);
                    background: var(--panel); }
+  .alert.cancel  { border-color: var(--warn); color: #fcd34d;
+                   background: rgba(251,191,36,.10); }
 
   /* 最终摘要（绿色大卡片） */
   .card-finish {
@@ -325,6 +327,20 @@
     width: 44px; height: 44px; font-size: 17px; cursor: pointer; flex-shrink: 0;
   }
   #send:disabled { opacity: .4; cursor: default; }
+  #stop {
+    background: #da3633; color: #fff; border: none; border-radius: 12px;
+    height: 44px; width: 44px; padding: 0; cursor: pointer; flex-shrink: 0;
+    position: relative;
+  }
+  #stop::before {
+    content: "";
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 14px; height: 14px;
+    background: #fff; border-radius: 2px;
+  }
+  #stop:hover { background: #b62b28; }
+  #stop:disabled { opacity: .5; cursor: default; }
   #hint { max-width: 900px; margin: 6px auto 0; color: var(--faint);
           font-size: 11.5px; text-align: center; }
 
@@ -374,6 +390,7 @@
   <div class="inner">
     <textarea id="input" rows="1"
       placeholder="描述任务，回车发送 · Shift+回车换行"></textarea>
+    <button id="stop" title="停止任务" hidden></button>
     <button id="send" title="发送">➤</button>
   </div>
   <div id="hint">写操作默认需确认（y 允许 · n 拒绝 · a 本次会话全部允许）</div>
@@ -413,7 +430,8 @@ function renderModelMarkdown(bubble) {
 
 const state = {
   running: false, auto: false, turns: 0, tools: 0, denied: 0,
-  replaying: false,
+  replaying: false, stopped: false,   // stopped: 已点停止，等待旧任务收尾中
+  discardUntilTaskEnd: false,          // 停止后丢弃旧任务继续冒出的 delta/assistant
   taskT0: null, timer: null, lastSeq: -1,
   modelEl: null,          // 当前流式模型气泡
   toolCards: new Map(),   // call_id -> 卡片元素
@@ -453,6 +471,8 @@ function briefArgs(name, args) {
 function setRunning(on) {
   state.running = on;
   input.disabled = on; $("send").disabled = on;
+  /* 运行中显示"停止"、隐藏"发送"；空闲时反之 */
+  $("stop").hidden = !on; $("send").style.display = on ? "none" : "";
   input.placeholder = on ? "任务执行中，请稍候…" : "描述任务，回车发送 · Shift+回车换行";
   const el = $("st-state");
   el.textContent = on ? "● 运行中" : "空闲";
@@ -708,19 +728,22 @@ function handleEvent(e) {
                         if (!state.replaying) {
                           setRunning(true);
                           state.turns = state.tools = 0;
+                          state.stopped = false;
                           bump("st-turns", 0); bump("st-tools", 0);
                           $("st-elapsed").textContent = "0.0s";
                         }
                         break;
     case "turn_start":  addTurnDivider(p.turn); break;
-    case "delta":       { const b = ensureModelBubble();
-                          b.querySelector(".txt").textContent += p.text;
-                          scrollDown(); break; }
-    case "assistant":   { const txt = p.content || "";
-                          if (txt) { const b = ensureModelBubble();
-                                     const t = b.querySelector(".txt");
-                                     if (!t.textContent) t.textContent = txt; }
-                          closeModelBubble(); scrollDown(); break; }
+    case "delta":       if (state.discardUntilTaskEnd) break;
+                          { const b = ensureModelBubble();
+                            b.querySelector(".txt").textContent += p.text;
+                            scrollDown(); break; }
+    case "assistant":   if (state.discardUntilTaskEnd) break;
+                          { const txt = p.content || "";
+                            if (txt) { const b = ensureModelBubble();
+                                       const t = b.querySelector(".txt");
+                                       if (!t.textContent) t.textContent = txt; }
+                            closeModelBubble(); scrollDown(); break; }
     case "tool_start":  toolCard(p); scrollDown(); break;
     case "tool_end":    renderToolEnd(p); break;
     case "confirm_request": addConfirm(p); break;
@@ -742,9 +765,16 @@ function handleEvent(e) {
                          `<div class="alert session">— ${esc(p.message)} —</div>`));
                        scrollDown();
                        if (!state.running) setRunning(false); break;
+    case "cancel":     if (state.stopped) break;   // 停止提示已由点击时展示，去重
+                       state.stopped = true;
+                       feed.appendChild(el(
+                         `<div class="alert cancel">⏹ ${esc(p.message || "任务已取消")} · 可直接输入新任务继续</div>`));
+                       scrollDown(true); break;
     case "finish":     break;   /* 摘要在 task_end 里统一出 */
-    case "task_end":   if (p.summary) addFinish(p);
-                       else { setRunning(false); }
+    case "task_end":   /* 取消返回的摘要以 [已取消] 开头，不渲染"完成"卡片 */
+                       state.discardUntilTaskEnd = false;
+                       if (p.summary && !String(p.summary).startsWith("[已取消]"))
+                         addFinish(p);
                        if (state.taskT0) {
                          $("st-elapsed").textContent = fmtMs(p.elapsed_ms || 0);
                          state.taskT0 = null;
@@ -807,14 +837,33 @@ async function send() {
   const text = input.value.trim();
   if (!text || state.running) return;
   input.value = ""; input.style.height = "auto";
-  const r = await fetch("/api/task", { method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ message: text }) });
-  if (!r.ok) {
+  /* 协作式取消：停止后旧任务会在"下一个步骤边界"前终止，期间可能仍需数秒
+     （正在进行的模型生成 / 工具会先跑完）。后端在此期间返回 409，前端平滑退避
+     重试，并以一条中性的"正在停止…"提示代替报错——停止后用户可立即输入、无感续跑，
+     绝不弹"任务忙"。 */
+  let hint = null;
+  for (let attempt = 0; attempt < 140; attempt++) {
+    const r = await fetch("/api/task", { method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ message: text }) });
+    if (r.ok) {
+      if (hint) { hint.remove(); hint = null; }
+      state.stopped = false; return;
+    }
+    if (r.status === 409) {
+      if (!hint) {
+        hint = el(`<div class="alert session" id="stopping-hint">⏳ 正在停止上一个任务，请稍候…</div>`);
+        feed.appendChild(hint); scrollDown(true);
+      }
+      await new Promise(res => setTimeout(res, 200)); continue;
+    }
     const j = await r.json().catch(() => ({}));
     feed.appendChild(el(`<div class="alert error">✘ ${esc(j.message || "提交失败")}</div>`));
     scrollDown(true);
+    return;
   }
+  feed.appendChild(el(`<div class="alert error">✘ 上一个任务迟迟未停止，请刷新页面后重试</div>`));
+  scrollDown(true);
 }
 
 /* ---------------- 会话列表：展示 / 切换 / 删除 ---------------- */
@@ -875,6 +924,24 @@ async function deleteSession(id) {
 
 /* ---------------- 交互绑定 ---------------- */
 $("send").onclick = send;
+$("stop").onclick = async () => {
+  if (!state.running) return;
+  try {
+    const r = await fetch("/api/stop", { method: "POST" });
+    if (r.ok) {
+      /* 立刻释放输入：不等任务真正收尾，用户可马上输入新任务续跑。
+         协作式取消下当前这轮 LLM 生成还会继续返回事件；关闭当前气泡并
+         丢弃旧任务后续冒出的 delta/assistant，避免它们再开新气泡导致重复输出。 */
+      setRunning(false);
+      closeModelBubble();
+      state.stopped = true;
+      state.discardUntilTaskEnd = true;
+      feed.appendChild(el(
+        `<div class="alert cancel">⏹ 已停止 · 可直接输入新任务继续</div>`));
+      scrollDown(true);
+    }
+  } catch (_) {}
+};
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });

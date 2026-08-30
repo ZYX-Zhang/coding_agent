@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 
 from .context import Context
 from .tools import FINISH_MARKER
@@ -23,7 +24,7 @@ IDLE_NUDGE = (
 class Agent:
     def __init__(self, llm, tools, context: Context | None = None,
                  safety=None, max_turns: int = 40, on_event=None,
-                 on_delta=None):
+                 on_delta=None, should_cancel: Callable[[], bool] | None = None):
         """
         :param llm:     任意实现了 chat(messages, tools=None) -> dict 的对象
         :param tools:   ToolRegistry
@@ -43,6 +44,7 @@ class Agent:
         self.max_turns = max_turns
         self.on_event = on_event or (lambda kind, payload: None)
         self.on_delta = on_delta
+        self.should_cancel = should_cancel        # 协作式取消：步骤边界检查
         self._call_seq = 0        # 工具调用序号，供前端把 tool_start/tool_end 配对
 
     @property
@@ -60,9 +62,15 @@ class Agent:
 
         idle = 0  # 连续"只说话不干活"计数
         for turn in range(1, self.max_turns + 1):
+            # 协作式取消：在进入下一轮模型调用前检查（用户已点停止）
+            if self._cancelled():
+                self.on_event("cancel", {
+                    "message": "任务已取消，已有修改与会话记录已保留。"})
+                return "[已取消] 任务已取消，已有修改与会话记录已保留。"
+
             self.on_event("turn_start", {"turn": turn})
 
-            sent = self.ctx.messages_for_llm()  # 裁剪后的视图
+            sent = self.ctx.messages_for_llm()          # 裁剪后的视图
             extra = {"on_delta": self.on_delta} if self.on_delta else {}
             resp = self.llm.chat(sent, tools=self.tools.schemas(), **extra)
 
@@ -87,7 +95,22 @@ class Agent:
 
             # ---- 分支 2：逐个执行工具，结果回填 ----
             finished_summary = None
-            for tc in tool_calls:
+            for idx, tc in enumerate(tool_calls):
+                # 协作式取消：在当前工具执行前检查（用户已点停止）。
+                # 给本工具及后续尚未执行的工具补一条 [cancelled] 结果，
+                # 让 assistant(tool_calls)+tool 结果保持配对、对话历史合法，
+                # 便于取消后用户继续输入新任务从该会话续跑。
+                if self._cancelled():
+                    for pend in tool_calls[idx:]:
+                        self.ctx.add_tool_result(
+                            pend["id"],
+                            "[cancelled] 用户取消了任务，后续工具未执行。",
+                            tool_name=pend["function"]["name"])
+                    self.on_event("cancel", {
+                        "message": "任务已取消，剩余工具未执行，已有修改与会话记录已保留。"})
+                    return ("[已取消] 任务已取消，剩余工具未执行，"
+                            "已有修改与会话记录已保留。")
+
                 result = self._dispatch(tc)
                 self.ctx.add_tool_result(tc["id"], result,
                                          tool_name=tc["function"]["name"])
@@ -101,6 +124,14 @@ class Agent:
 
         # ---- 分支 3：轮数熔断 ----
         return f"已达到最大轮数上限（{self.max_turns}），任务未明确完成。"
+
+    # ------------------------------------------------------------------ #
+    def _cancelled(self) -> bool:
+        """协作式取消：由外部（Web 停止按钮 / CLI 信号）驱动，步骤边界检查。"""
+        try:
+            return bool(self.should_cancel and self.should_cancel())
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ #
     def _dispatch(self, tc: dict) -> str:

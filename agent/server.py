@@ -91,7 +91,7 @@ class WebSafety:
             self.bus.publish("denied", {"tool": name, "reason": reason})
             return False
 
-        if self.auto_allowed:  # 用户在浏览器按过"全部允许"
+        if self.auto_allowed:                    # 用户在浏览器按过"全部允许"
             self.confirmed.append(f"{name}: {reason} (auto)")
             return True
 
@@ -106,7 +106,7 @@ class WebSafety:
                           "args": req["args"]})
         ok = req["event"].wait(self.timeout)
         self._pending.pop(cid, None)
-        answer = req["answer"] if ok else "n"  # 超时 = 拒绝
+        answer = req["answer"] if ok else "n"    # 超时 = 拒绝
 
         self.bus.publish("confirm_result",
                          {"id": cid, "answer": answer,
@@ -188,20 +188,27 @@ class WebApp:
 
         self.bus = EventBus()
         self.running = False
+        self.cancelled = False              # 协作式取消标志（stop 置位）
         self._run_lock = threading.Lock()
+        self._worker_thread: threading.Thread | None = None  # 当前后台任务线程
+        # 让 LLM 客户端在用户点停止时立即中断流式调用（见 llm.LLMCancelled）
+        try:
+            self.llm.should_cancel = lambda: self.cancelled
+        except Exception:
+            pass
         self.safety: WebSafety | AutoSafety | None = None
         self.session: Session | None = None
         self._saved_len = 0
-        self._task_t0: float | None = None  # 当前任务开始时刻
-        self._last_elapsed_ms: int = 0  # 上一任务总耗时
-        self._last_summary: str = ""  # 上一任务 finish 摘要
+        self._task_t0: float | None = None       # 当前任务开始时刻
+        self._last_elapsed_ms: int = 0           # 上一任务总耗时
+        self._last_summary: str = ""             # 上一任务 finish 摘要
         self._new_session()
 
     # ---------------------------------------------------------------- #
     def _new_session(self) -> None:
         if self.session:
             self.session.close()
-        self.bus = EventBus()  # 事件流随会话重置
+        self.bus = EventBus()               # 事件流随会话重置
         self.session_dir.mkdir(parents=True, exist_ok=True)
         ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         self.session = Session(self.session_dir / f"{ts}.jsonl")
@@ -211,12 +218,14 @@ class WebApp:
         self.web_ask = WebAsk(self.bus)
         self.agent = Agent(self.llm,
                            build_registry(self.workspace, llm=self.llm,
-                                          ask=self.web_ask.ask),
+                                          ask=self.web_ask.ask,
+                                          should_cancel=lambda: self.cancelled),
                            context=self.ctx, safety=self.safety,
                            max_turns=self.max_turns,
                            on_event=lambda k, p: self.bus.publish(k, p),
                            on_delta=lambda t: self.bus.publish("delta",
-                                                               {"text": t}))
+                                                              {"text": t}),
+                           should_cancel=lambda: self.cancelled)
         self._saved_len = 0
 
     # ---------------------------------------------------------------- #
@@ -263,12 +272,14 @@ class WebApp:
         self.web_ask = WebAsk(self.bus)
         self.agent = Agent(self.llm,
                            build_registry(self.workspace, llm=self.llm,
-                                          ask=self.web_ask.ask),
+                                          ask=self.web_ask.ask,
+                                          should_cancel=lambda: self.cancelled),
                            context=self.ctx, safety=self.safety,
                            max_turns=self.max_turns,
                            on_event=lambda k, p: self.bus.publish(k, p),
                            on_delta=lambda t: self.bus.publish("delta",
-                                                              {"text": t}))
+                                                              {"text": t}),
+                           should_cancel=lambda: self.cancelled)
         self.session = Session(path)    # 继续追加到同一文件（续跑落盘）
         self._saved_len = len(self.ctx.messages)
         self._replay_to_bus(msgs)
@@ -326,17 +337,51 @@ class WebApp:
 
     # ---------------------------------------------------------------- #
     def start_task(self, message: str) -> tuple[bool, str]:
-        """提交任务；已在运行则拒绝。"""
-        with self._run_lock:
-            if self.running:
-                return False, "已有任务在运行，请等待完成"
-            self.running = True
+        """提交任务（单任务模型，参照 WorkBuddy 的停止语义）。
+
+        只有一个后台 worker 在跑。只要上一任 worker 线程还活着——无论是正常执行，
+        还是刚被停止、正在退场——都拒绝新提交（返回 409）。前端据此退避重试；
+        新任务真正开始的前提是上一任 agent.run 已彻底退出，因此绝不会有两个
+        agent.run 并发写同一份 ctx，从根上杜绝会话历史错乱，也无需任何"在后台
+        join 旧任务"的阻塞（那正是之前卡顿/不显示任务的根因）。
+
+        停止后的退场很快（LLM 流每片检查取消、命令每 0.1s 轮询取消并杀进程树、
+        llm 看门狗兜底网络停滞），通常 < 1s，用户几乎无感。
+        """
         import time as _time
-        self._task_t0 = _time.monotonic()
+        old = self._worker_thread
+        if old is not None and old.is_alive():
+            return False, "上一个任务仍在停止中，请稍候"
+        with self._run_lock:
+            self.running = True
+            self.cancelled = False          # 新任务从干净状态开始
+        # 立刻广播 user 事件：前端马上显示任务气泡（stop 已提前释放输入）
         self.bus.publish("user", {"message": message})
-        threading.Thread(target=self._worker, args=(message,),
-                         daemon=True).start()
+        self._task_t0 = _time.monotonic()
+        t = threading.Thread(target=self._worker, args=(message,),
+                             daemon=True)
+        self._worker_thread = t
+        t.start()
         return True, "已开始"
+
+    def cancel_task(self) -> bool:
+        """停止当前任务（协作式取消）。
+
+        仅置位 cancelled 标志，让：
+          · Agent 主循环在每轮顶部、每个工具执行前检查而主动终止；
+          · 正在进行的 LLM 流式调用在 _chat_stream 每片（或看门狗超时）检查后
+            中断并抛 LLMCancelled；
+          · 正在跑的命令被 run_cancellable 杀进程树。
+        因此任务几乎瞬间结束，且取消前的文件改动/会话历史全部保留、可续跑。
+
+        注意：这里不把 running 置 False——改由 worker 的 finally 收尾。这样在退场
+        期间 start_task 的「worker 存活」守卫持续返回 409，新任务会等旧 worker 真正
+        退出后再开始（无卡顿、无并发写），停止后用户可立即输入并续跑。
+        """
+        if not self.running:
+            return False
+        self.cancelled = True
+        return True
 
     def _worker(self, message: str) -> None:
         import time as _time
@@ -348,14 +393,18 @@ class WebApp:
                 self.bus.publish("warning", {"message": summary})
         except LLMError as e:
             self.bus.publish("error", {"message": f"模型调用失败: {e}"})
-        except Exception as e:  # 理论上到不了，兜底
+        except Exception as e:                       # 兜底
             self.bus.publish("error",
                              {"message": f"{type(e).__name__}: {e}"})
         finally:
+            # 落盘保留改动（即便被取消也保留，便于续跑）
             self._flush_session()
             elapsed = int((_time.monotonic() - (self._task_t0 or _time.monotonic()))
                           * 1000)
             self._last_elapsed_ms = elapsed
+            # 收尾：worker 线程此刻已彻底退出（is_alive() 随之变 False），
+            # 故 start_task 的「worker 存活」守卫在真正结束后才放行新任务，
+            # 绝不会与下一个 agent.run 并发写同一份 ctx。
             with self._run_lock:
                 self.running = False
             self.bus.publish("task_end", {"elapsed_ms": elapsed,
@@ -379,7 +428,7 @@ class WebApp:
         import time as _time
         elapsed = (self._last_elapsed_ms if not self.running and self._last_elapsed_ms
                    else int((_time.monotonic() - self._task_t0) * 1000)
-        if self.running and self._task_t0 else 0)
+                   if self.running and self._task_t0 else 0)
         safety = self.safety
         return {
             "running": self.running,
@@ -407,9 +456,9 @@ class WebApp:
 # HTTP 服务
 # ---------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
-    app: WebApp  # 类属性，serve() 时注入
+    app: WebApp            # 类属性，serve() 时注入
 
-    def log_message(self, *args):  # 静默访问日志
+    def log_message(self, *args):                   # 静默访问日志
         pass
 
     # ---- 工具方法 ---- #
@@ -465,7 +514,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 after, batch = self.app.bus.wait_batch(after)
-                if not batch:  # keepalive
+                if not batch:                       # keepalive
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                     continue
@@ -474,7 +523,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
-            pass  # 浏览器关掉了页面
+            pass                                    # 浏览器关掉了页面
 
     # ---- POST ---- #
     def do_POST(self):
@@ -520,13 +569,19 @@ class Handler(BaseHTTPRequestHandler):
             self.app._new_session()
             self.app.bus.publish("session", {"message": "已开始新会话"})
             self._json({"ok": True, "session_file":
-                str(self.app.session.path)})
+                        str(self.app.session.path)})
         elif url.path == "/api/auto":
             self.app.set_auto(bool(body.get("on")))
             self.app.bus.publish("session", {
                 "message": "已切换为自动确认（写操作不再询问）"
                 if self.app.auto else "已切换为逐项确认"})
             self._json({"ok": True, "auto": self.app.auto})
+        elif url.path == "/api/stop":
+            ok = self.app.cancel_task()
+            self._json({"ok": ok,
+                        "message": "已请求停止，Agent 将在下一步骤前终止"
+                        if ok else "当前没有运行中的任务"},
+                       200 if ok else 409)
         else:
             self._json({"error": "not found"}, 404)
 
