@@ -218,7 +218,9 @@ class WebApp:
         self.agent = Agent(self.llm,
                            build_registry(self.workspace, llm=self.llm,
                                           ask=self.web_ask.ask,
-                                          should_cancel=lambda: self.cancelled),
+                                          should_cancel=lambda: self.cancelled,
+                                          on_event=lambda k, p:
+                                              self.bus.publish(k, p)),
                            context=self.ctx, safety=self.safety,
                            max_turns=self.max_turns,
                            on_event=lambda k, p: self.bus.publish(k, p),
@@ -274,7 +276,9 @@ class WebApp:
         self.agent = Agent(self.llm,
                            build_registry(self.workspace, llm=self.llm,
                                           ask=self.web_ask.ask,
-                                          should_cancel=lambda: self.cancelled),
+                                          should_cancel=lambda: self.cancelled,
+                                          on_event=lambda k, p:
+                                              self.bus.publish(k, p)),
                            context=self.ctx, safety=self.safety,
                            max_turns=self.max_turns,
                            on_event=lambda k, p: self.bus.publish(k, p),

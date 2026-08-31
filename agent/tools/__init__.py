@@ -34,7 +34,7 @@ __all__ = [
 
 
 def build_registry(workspace: str, llm=None, ask=None,
-                   should_cancel=None) -> ToolRegistry:
+                   should_cancel=None, on_event=None) -> ToolRegistry:
     """装配默认工具集。Agent 循环只拿这个注册表，加新工具不改循环。"""
     reg = ToolRegistry()
     # 顺序即下发给模型的 tools 顺序，finish 放最后
@@ -45,7 +45,7 @@ def build_registry(workspace: str, llm=None, ask=None,
     reg.register(SearchFilesTool(workspace))  # 5. 找文件
     reg.register(RunCommandTool(workspace, should_cancel))  # 6. 执行命令
     reg.register(FinishTool())  # 7. 终止（不属于"手脚"，是出口）
-    reg.register(PlanTool())  # 8. 任务计划管理
+    reg.register(PlanTool(on_event=on_event))  # 8. 任务计划管理
     reg.register(AskUserTool(ask))  # 9. 向用户提问
     reg.register(FetchUrlTool())  # 10. 获取文档
     reg.register(SearchCodeTool(workspace))  # 11.  按内容找（正则）
