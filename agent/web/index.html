@@ -324,6 +324,20 @@
                font-size: 12px; border-top: 1px solid var(--line);
                padding-top: 8px; margin-top: 6px; }
   .fin-stats b { color: var(--fg); font-family: var(--mono); }
+  .fin-undo {
+    margin: 10px 0 2px; padding: 7px 14px; border-radius: 8px;
+    border: 1px solid var(--warn); background: transparent; color: var(--warn);
+    cursor: pointer; font-size: 13px; font-weight: 600;
+  }
+  .fin-undo:hover { background: rgba(245,158,11,.12); }
+  .toast {
+    position: fixed; left: 50%; bottom: 78px; transform: translateX(-50%);
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    padding: 9px 15px; border-radius: 9px; font-size: 13px; z-index: 60;
+    opacity: 0; transition: opacity .25s; pointer-events: none; max-width: 82vw;
+    box-shadow: 0 6px 20px rgba(0,0,0,.25);
+  }
+  .toast.err { border-color: var(--err); color: var(--err); }
 
   /* ---------- 底部输入区 ---------- */
   #composer {
@@ -400,6 +414,7 @@
   <div class="stat">耗时<b id="st-elapsed">0.0s</b></div>
   <div class="stat">上下文<b id="st-tokens">0</b></div>
   <div class="stat">被拒操作<b id="st-denied">0</b></div>
+  <button id="btn-undo" class="sb-btn" hidden>↩ 撤销本次任务</button>
 </div>
 
 <div id="chat"><div class="wrap" id="feed"></div></div>
@@ -752,8 +767,52 @@ function addFinish(p) {
     `<span>耗时 <b>${fmtMs(p.elapsed_ms || 0)}</b></span>` +
     `<span>上下文 <b>${fmtTokens(lastTokens)}</b> tokens</span>` +
     `</div></div>`);
+  if (p.can_undo) {
+    const ub = document.createElement("button");
+    ub.className = "fin-undo";
+    ub.textContent = "↩ 撤销本次任务的所有改动";
+    ub.onclick = undoTask;
+    card.querySelector(".fin-stats").after(ub);
+  }
   feed.appendChild(card);
   scrollDown(true);
+}
+
+/* ---------------- 一键撤销 ---------------- */
+function toast(msg, isErr) {
+  let t = $("toast");
+  if (!t) {
+    t = el(`<div id="toast" class="toast"></div>`);
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.className = "toast" + (isErr ? " err" : "");
+  t.style.opacity = "1";
+  clearTimeout(t._t);
+  t._t = setTimeout(() => { t.style.opacity = "0"; }, 3400);
+}
+
+async function undoTask() {
+  const b = $("btn-undo");
+  if (b.disabled) return;
+  b.disabled = true;
+  const old = b.textContent;
+  b.textContent = "恢复中…";
+  try {
+    const r = await (await fetch("/api/undo", { method: "POST" })).json();
+    if (r.ok) {
+      toast(`已恢复本次任务的文件改动（覆盖 ${r.restored} 个文件、`
+           + `删除 ${r.removed} 个新增文件）`);
+      b.hidden = true;
+    } else {
+      toast("撤销失败：" + (r.error || "未知错误"), true);
+    }
+  } catch (e) {
+    toast("撤销请求失败：" + e, true);
+  } finally {
+    b.disabled = false;
+    b.textContent = old;
+  }
 }
 
 /* ---------------- 事件分发 ---------------- */
@@ -845,6 +904,8 @@ function handleEvent(e) {
                        removeStoppingHint();   // 上一任务已就绪：清除"停止中"提示，可回车提交
                        if (p.summary && !String(p.summary).startsWith("[已取消]"))
                          addFinish(p);
+                       if (p.can_undo) $("btn-undo").hidden = false;
+                       else $("btn-undo").hidden = true;
                        if (state.taskT0) {
                          $("st-elapsed").textContent = fmtMs(p.elapsed_ms || 0);
                          state.taskT0 = null;
@@ -852,6 +913,9 @@ function handleEvent(e) {
                        if (state.timer) { clearInterval(state.timer);
                                           state.timer = null; }
                        setRunning(false); break;
+    case "undo_done":  $("btn-undo").hidden = true;
+                       toast(`已恢复本次任务的文件改动（覆盖 ${p.restored} 个文件、`
+                            + `删除 ${p.removed} 个新增文件）`); break;
   }
 }
 
@@ -894,6 +958,8 @@ async function refreshState(opts) {
     if (st.stats.turns && !state.running) bump("st-turns", st.stats.turns);
     if (st.stats.elapsed_ms && !state.running)
       $("st-elapsed").textContent = fmtMs(st.stats.elapsed_ms);
+    /* 撤销按钮：根据后端是否还有可撤销快照显示 */
+    $("btn-undo").hidden = !(st.can_undo && !st.running);
     /* 回放历史事件（页面刷新后）。切换/删除会话时由 SSE 回放，不在此处以免双重 */
     if (replayEvents && st.events && st.events.length) {
       st.events.forEach(handleEvent);
@@ -1077,6 +1143,7 @@ async function deleteSession(id) {
 
 /* ---------------- 交互绑定 ---------------- */
 $("send").onclick = send;
+$("btn-undo").onclick = undoTask;
 $("stop").onclick = async () => {
   if (!state.running) return;
   try {

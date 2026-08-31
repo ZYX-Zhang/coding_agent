@@ -22,6 +22,7 @@ from .context import Context
 from .llm import LLMClient, LLMError
 from .safety import AutoSafety, SafetyPolicy
 from .session import Session
+from .snapshot import take_snapshot, restore_snapshot
 from .tools import build_registry
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -197,6 +198,9 @@ class WebApp:
         self._task_t0: float | None = None       # 当前任务开始时刻
         self._last_elapsed_ms: int = 0           # 上一任务总耗时
         self._last_summary: str = ""             # 上一任务 finish 摘要
+        self._task_seq: int = 0                  # 任务序号（每次提交 +1）
+        self._last_snapshot_seq: int | None = None  # 最近一次可撤销的任务序号
+        self._last_snapshot_dir: str | None = None  # 最近一次快照目录
         self._new_session()
 
     # ---------------------------------------------------------------- #
@@ -376,6 +380,21 @@ class WebApp:
             self.cancelled = False          # 新任务从干净状态开始
         # 立刻广播 user 事件：前端马上显示任务气泡（stop 已提前释放输入）
         self.bus.publish("user", {"message": message})
+        # 任务开始前快照：把 workspace 全量备份到隐藏目录，供「一键撤销」恢复
+        self._task_seq += 1
+        seq = self._task_seq
+        snap_dir = (Path(self.workspace) / ".agent_snapshots"
+                    / (self.session.path.stem if self.session else "sess")
+                    / f"task-{seq}")
+        try:
+            n = take_snapshot(self.workspace, str(snap_dir))
+            self._last_snapshot_seq = seq
+            self._last_snapshot_dir = str(snap_dir)
+            self.bus.publish("snapshot", {"seq": seq, "files": n,
+                                          "dir": str(snap_dir)})
+        except Exception as e:                       # 快照失败不应阻断任务
+            self.bus.publish("warning",
+                             {"message": f"任务前快照失败（撤销不可用）: {e}"})
         self._task_t0 = _time.monotonic()
         t = threading.Thread(target=self._worker, args=(message,),
                              daemon=True)
@@ -424,8 +443,12 @@ class WebApp:
             # 绝不会与下一个 agent.run 并发写同一份 ctx。
             with self._run_lock:
                 self.running = False
-            self.bus.publish("task_end", {"elapsed_ms": elapsed,
-                                          "summary": summary})
+            self.bus.publish("task_end", {
+                "elapsed_ms": elapsed,
+                "summary": summary,
+                "can_undo": self._last_snapshot_seq is not None,
+                "undo_seq": self._last_snapshot_seq,
+            })
             self._task_t0 = None
 
     def _flush_session(self) -> None:
@@ -435,6 +458,27 @@ class WebApp:
         if fresh:
             self.session.extend(fresh)
             self._saved_len = len(self.ctx.messages)
+
+    # ---------------------------------------------------------------- #
+    def undo_last_task(self) -> dict:
+        """一键撤销最近一次任务产生的文件改动（恢复到任务开始前快照）。
+
+        只恢复 workspace 文件，不改动对话历史——用户仍能回看本次任务做了什么。
+        运行中不允许撤销（避免与正在跑的 agent 抢文件）。
+        """
+        if self._last_snapshot_dir is None:
+            return {"ok": False, "error": "没有可撤销的快照"}
+        if self.running:
+            return {"ok": False, "error": "任务运行中，请先停止后再撤销"}
+        try:
+            r = restore_snapshot(self.workspace, self._last_snapshot_dir)
+            self.bus.publish("undo_done", {"seq": self._last_snapshot_seq, **r})
+            # 快照已消费：撤销后该任务不再可重复撤销（刷新也不会再显示按钮）
+            self._last_snapshot_seq = None
+            self._last_snapshot_dir = None
+            return {"ok": True, **r}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     # ---------------------------------------------------------------- #
     def state(self) -> dict:
@@ -465,6 +509,8 @@ class WebApp:
                 "token_budget": self.ctx.max_tokens,
                 "session_file": str(self.session.path) if self.session else "",
                 "denied": len(getattr(safety, "denied", [])),
+                "can_undo": self._last_snapshot_seq is not None,
+                "undo_seq": self._last_snapshot_seq,
             },
         }
 
@@ -606,6 +652,8 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "已请求停止，Agent 将在下一步骤前终止"
                         if ok else "当前没有运行中的任务"},
                        200 if ok else 409)
+        elif url.path == "/api/undo":
+            self._json(self.app.undo_last_task())
         else:
             self._json({"error": "not found"}, 404)
 
