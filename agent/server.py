@@ -27,6 +27,24 @@ from .tools import build_registry
 
 WEB_DIR = Path(__file__).parent / "web"
 
+# 前端「代码查看」抽屉：文件扩展名 → highlight.js 语言名
+_LANG_MAP = {
+    ".py": "python", ".js": "javascript", ".jsx": "javascript",
+    ".ts": "typescript", ".tsx": "typescript", ".go": "go", ".rs": "rust",
+    ".java": "java", ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp",
+    ".hpp": "cpp", ".cxx": "cpp", ".cs": "csharp", ".rb": "ruby",
+    ".php": "php", ".sh": "bash", ".html": "xml", ".htm": "xml",
+    ".xml": "xml", ".css": "css", ".json": "json", ".yaml": "yaml",
+    ".yml": "yaml", ".md": "markdown", ".sql": "sql", ".lua": "lua",
+    ".kt": "kotlin", ".swift": "swift", ".scala": "scala", ".r": "r",
+    ".m": "objectivec", ".toml": "ini", ".ini": "ini", ".dockerfile": "dockerfile",
+}
+
+
+def _lang_of(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    return _LANG_MAP.get(ext, "")
+
 
 # ---------------------------------------------------------------- #
 # 事件总线：Agent 工作线程 publish，SSE 连接线程消费
@@ -485,6 +503,70 @@ class WebApp:
             return {"ok": False, "error": str(e)}
 
     # ---------------------------------------------------------------- #
+    # 代码浏览（前端「代码查看」抽屉）：只读文件树 + 源码内容，带安全过滤
+    _IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                    ".myagent", ".agent_snapshots", ".idea", ".vscode",
+                    ".mypy_cache", ".pytest_cache", ".tox"}
+
+    def _safe_rel(self, rel: str) -> Path | None:
+        """把前端传来的相对路径解析为工作区内的绝对路径；越界返回 None。"""
+        try:
+            cand = (Path(self.workspace) / (rel or "")).resolve()
+        except (OSError, ValueError):
+            return None
+        ws = Path(self.workspace).resolve()
+        # 必须在 workspace 内（防 ../ 穿越）；workspace 自身允许（rel=""）
+        if cand != ws and ws not in cand.parents:
+            return None
+        return cand
+
+    def file_tree(self, rel: str = "") -> dict:
+        """返回 rel 目录下的条目（一层）。dir=True 为目录。
+
+        仅暴露工作区内的源码，过滤噪音目录（.git / node_modules / .myagent 等）。
+        """
+        base = self._safe_rel(rel)
+        if base is None:
+            return {"ok": False, "error": "非法路径"}
+        if not base.exists():
+            return {"ok": False, "error": "路径不存在"}
+        if not base.is_dir():
+            return {"ok": False, "error": "不是目录"}
+        ws = Path(self.workspace).resolve()
+        entries = []
+        for p in sorted(base.iterdir(),
+                        key=lambda x: (not x.is_dir(), x.name.lower())):
+            if p.name in self._IGNORE_DIRS:
+                continue
+            try:
+                relp = str(p.relative_to(ws))
+            except ValueError:
+                continue
+            entries.append({"name": p.name, "path": relp, "dir": p.is_dir()})
+        return {"ok": True, "path": rel or "", "entries": entries}
+
+    def read_source(self, rel: str = "") -> dict:
+        """读取工作区内某个文本文件的源码内容 + 推断语言（供前端高亮）。"""
+        base = self._safe_rel(rel)
+        if base is None:
+            return {"ok": False, "error": "非法路径"}
+        if not base.exists() or not base.is_file():
+            return {"ok": False, "error": "文件不存在"}
+        try:
+            size = base.stat().st_size
+        except OSError:
+            return {"ok": False, "error": "无法读取"}
+        if size > 512_000:
+            return {"ok": False,
+                    "error": f"文件过大（约 {size // 1024}KB），不预览"}
+        try:
+            text = base.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            return {"ok": False, "error": "二进制或无法解码的文件"}
+        return {"ok": True, "path": rel, "language": _lang_of(rel),
+                "content": text}
+
+    # ---------------------------------------------------------------- #
     def state(self) -> dict:
         tool_calls = sum(1 for e in self.bus.events
                          if e["kind"] == "tool_end")
@@ -562,6 +644,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "会话不存在"}, 404)
             else:
                 self._json(data)
+        elif url.path == "/api/files":
+            self._json(self.app.file_tree(qs.get("path", [""])[0]))
+        elif url.path == "/api/file":
+            self._json(self.app.read_source(qs.get("path", [""])[0]))
         elif url.path == "/api/events":
             self._serve_sse(url)
         else:

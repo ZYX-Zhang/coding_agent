@@ -376,6 +376,53 @@
   #hint { max-width: 900px; margin: 6px auto 0; color: var(--faint);
           font-size: 11.5px; text-align: center; }
 
+
+  /* ---------- 右侧代码查看抽屉 ---------- */
+  #codeview {
+    width: 460px; flex-shrink: 0; background: var(--panel);
+    border-left: 1px solid var(--line); display: none;
+    flex-direction: column; overflow: hidden;
+  }
+  #codeview.open { display: flex; }
+  .cv-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px; border-bottom: 1px solid var(--line); flex-shrink: 0;
+  }
+  .cv-head .cv-title { font-size: 13px; color: var(--dim); flex: 1;
+                     letter-spacing: .5px; }
+  .cv-head button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 9px; font-size: 12px; cursor: pointer;
+  }
+  .cv-head button:hover { border-color: var(--info); }
+  .cv-body { flex: 1; display: flex; min-height: 0; }
+  .cv-tree {
+    width: 44%; overflow: auto; padding: 8px 4px;
+    border-right: 1px solid var(--line); font-size: 12.5px; flex-shrink: 0;
+  }
+  .cv-tree ul { list-style: none; margin: 0; padding-left: 13px; }
+  .cv-tree > ul { padding-left: 4px; }
+  .cv-node {
+    padding: 2px 6px; border-radius: 5px; cursor: pointer; color: var(--fg);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono);
+  }
+  .cv-node:hover { background: var(--panel2); }
+  .cv-node.dir { color: var(--info); }
+  .cv-node.active { background: rgba(96,165,250,.14); color: var(--info); }
+  .cv-node .tw { display: inline-block; width: 14px; color: var(--faint); }
+  .cv-preview { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .cv-path {
+    padding: 6px 10px; font-family: var(--mono); font-size: 11px; color: var(--faint);
+    border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; flex-shrink: 0;
+  }
+  .cv-code {
+    flex: 1; overflow: auto; margin: 0; padding: 10px 12px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.55; color: var(--fg);
+    white-space: pre; tab-size: 4;
+  }
+  .cv-code.placeholder { color: var(--faint); white-space: normal; }
+
   ::-webkit-scrollbar { width: 9px; height: 9px; }
   ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -383,6 +430,10 @@
 <!-- Markdown 渲染：模型输出展示富文本。离线时自动降级为纯文本 -->
 <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
+<!-- 代码高亮（highlight.js）。离线时自动降级：代码块仍渲染为纯文本，只是无配色 -->
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"></script>
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
 </head>
 <body>
 
@@ -404,6 +455,7 @@
     <span>会话 <b id="h-session">…</b></span>
   </div>
   <div class="spacer"></div>
+  <button id="btn-code" title="查看工作区代码">代码</button>
   <button id="btn-auto" title="写操作不再逐项询问（高危命令仍拦截）">确认模式</button>
 </header>
 
@@ -429,6 +481,21 @@
   <div id="hint">写操作默认需确认（y 允许 · n 拒绝 · a 本次会话全部允许）</div>
 </div>
 </div><!-- /#main -->
+
+<aside id="codeview">
+  <div class="cv-head">
+    <span class="cv-title">📂 代码</span>
+    <button id="btn-cv-refresh" title="重新读取工作区文件">刷新</button>
+    <button id="btn-cv-close" title="关闭代码视图">✕</button>
+  </div>
+  <div class="cv-body">
+    <div class="cv-tree" id="cv-tree"></div>
+    <div class="cv-preview">
+      <div class="cv-path" id="cv-path">— 选择文件查看 —</div>
+      <pre class="cv-code placeholder" id="cv-code">点击左侧文件查看源码</pre>
+    </div>
+  </div>
+</aside>
 
 <script>
 "use strict";
@@ -1142,9 +1209,87 @@ async function deleteSession(id) {
   loadSessions();
 }
 
+/* ---------------- 代码查看抽屉 ---------------- */
+let _cvLoaded = false;
+function toggleCodeView() {
+  const cv = $("codeview");
+  const open = cv.classList.toggle("open");
+  const btn = $("btn-code");
+  if (open) {
+    btn.classList.add("on");
+    if (!_cvLoaded) { refreshCodeTree(); _cvLoaded = true; }
+  } else {
+    btn.classList.remove("on");
+  }
+}
+function refreshCodeTree() {
+  const tree = $("cv-tree");
+  tree.innerHTML = "";
+  loadCodeTree("", tree);
+}
+function loadCodeTree(rel, parentUl) {
+  fetch("/api/files?path=" + encodeURIComponent(rel))
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) { toast(d.error || "读取文件列表失败", true); return; }
+      const ul = document.createElement("ul");
+      (d.entries || []).forEach(e => {
+        const li = document.createElement("li");
+        const node = document.createElement("div");
+        node.className = "cv-node " + (e.dir ? "dir" : "file");
+        node.innerHTML = `<span class="tw">${e.dir ? "▸" : "·"}</span>` + esc(e.name);
+        node.onclick = (ev) => {
+          ev.stopPropagation();
+          if (e.dir) {
+            if (node._expanded) {
+              node._expanded = false;
+              node.querySelector(".tw").textContent = "▸";
+              if (node._ul) { node._ul.remove(); node._ul = null; }
+            } else {
+              node._expanded = true;
+              node.querySelector(".tw").textContent = "▾";
+              const sub = document.createElement("ul");
+              node._ul = sub; li.appendChild(sub);
+              loadCodeTree(e.path, sub);
+            }
+          } else {
+            openCodeFile(e.path, node);
+          }
+        };
+        li.appendChild(node);
+        ul.appendChild(li);
+      });
+      parentUl.appendChild(ul);
+    })
+    .catch(err => toast("加载文件列表失败: " + err, true));
+}
+function openCodeFile(path, node) {
+  document.querySelectorAll(".cv-node.active").forEach(n => n.classList.remove("active"));
+  if (node) node.classList.add("active");
+  fetch("/api/file?path=" + encodeURIComponent(path))
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) { toast(d.error || "读取文件失败", true); return; }
+      $("cv-path").textContent = d.path;
+      const pre = $("cv-code");
+      pre.className = "cv-code";
+      pre.textContent = d.content;
+      if (window.hljs && d.language) {
+        pre.className = "cv-code language-" + d.language;
+        try { window.hljs.highlightElement(pre); } catch (_) {}
+      }
+    })
+    .catch(err => toast("打开文件失败: " + err, true));
+}
+
 /* ---------------- 交互绑定 ---------------- */
 $("send").onclick = send;
 $("btn-undo").onclick = undoTask;
+$("btn-code").onclick = toggleCodeView;
+$("btn-cv-close").onclick = () => {
+  $("codeview").classList.remove("open"); $("btn-code").classList.remove("on");
+};
+$("btn-cv-refresh").onclick = refreshCodeTree;
 $("stop").onclick = async () => {
   if (!state.running) return;
   try {
