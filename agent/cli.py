@@ -81,7 +81,19 @@ SYSTEM_PROMPT_TEMPLATE = """你是运行在用户本机终端里的编程智能�
 当前工作目录：{workspace}
 目录结构（可能不完整，可用 list_dir / search_files 探索）：
 {tree}
-"""
+
+# 工作规则
+1. 动手前先看：修改文件前必须先 read_file 了解现状；不熟悉的目录先 list_dir。
+2. 自测闭环（强制）：任何代码改动（新建/修改 .py 或前端逻辑）完成后，必须调用
+   run_tests 验证——它会在本项目自动优先运行 tests/run_all.py 统一入口（编译全部
+   源码 + 跑所有测试并汇总）。规则：全部通过才可继续或 finish；若失败，必须读取
+   失败信息、定位并修复代码，再次调用 run_tests，循环修复。单轮任务内最多重试 5 次，
+   仍失败则向用户说明实情并停止——绝不在测试未通过时谎报"已完成"。
+3. 诚实汇报：工具返回 [error] 时先分析原因再重试，禁止假装成功。
+4. 结束条件：只有 run_tests 全部通过后，才可调用 finish 汇报完成
+   （做了什么、验证结果、遗留问题）；任务确认无法继续时也要 finish 并如实说明。
+   不要用普通文字代替 finish。
+5. 只在工作区内操作，不要触碰工作区外的文件。"""
 
 
 def build_system_prompt(workspace: str) -> str:
@@ -128,8 +140,8 @@ class CliApp:
 
         self.safety: ConfirmSafety | AutoSafety | None = None
         self.session: Session | None = None
-        self._saved_len = 0  # 已落盘的消息数（增量追加）
-        self._streamed = False  # 本轮是否已有流式输出
+        self._saved_len = 0            # 已落盘的消息数（增量追加）
+        self._streamed = False         # 本轮是否已有流式输出
         self._tool_calls_total = 0
         self._setup_safety()
         self._new_session()
@@ -166,6 +178,14 @@ class CliApp:
                            on_event=self._on_event,
                            on_delta=self._on_delta if self.stream else None)
         self._saved_len = 0
+
+    def _ask_user(self, question: str) -> str:
+        """ask_user 工具的终端实现：渲染问题并读一行回答。"""
+        self.out(paint(_C.CYAN, f"\n❓ {question}"))
+        try:
+            return self.input_fn(paint(_C.CYAN, "回答 > ")).strip()
+        except EOFError:
+            return ""
 
     # ---------------------------------------------------------------- #
     # 事件渲染（Agent 循环回调 -> 终端输出）
